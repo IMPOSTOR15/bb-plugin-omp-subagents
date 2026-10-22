@@ -15,7 +15,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 
 // The sessions root is read per call, so a static import is safe here.
 import host from "../src/host.ts";
-import { parseAgentFile, parseLatestTaskAgents, parseTranscript } from "../src/omp.ts";
+import { parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
 import { spawnedIdsFromOutput } from "../src/spawn.ts";
 
@@ -290,5 +290,21 @@ describe("activityLine", () => {
   });
   it("shows the task, not the last tool, once the agent settled", () => {
     assert.equal(activityLine({ ...base, status: "finished" }), "audit the parser");
+  });
+});
+
+describe("taskBody", () => {
+  it("leads with the Change section and drops heading markers", () => {
+    const text = "Complete assignment thoroughly:\n\n# Target No files. # Change Run bash `sleep 120`, then yield. # Acceptance Both ran.";
+    assert.equal(taskBody(text), "Run bash `sleep 120`, then yield.");
+  });
+  it("handles headings on their own lines", () => {
+    assert.equal(taskBody("# Target\nsrc/a.ts\n\n# Change\nRename foo to bar.\n\n# Acceptance\nTests pass."), "Rename foo to bar.");
+  });
+  it("falls back to the plain text when there are no headings", () => {
+    assert.equal(taskBody("Fix the flaky   login test"), "Fix the flaky login test");
+  });
+  it("uses the Goal when there is no Change", () => {
+    assert.equal(taskBody("# Goal\nMap the auth flow.\n# Constraints\nRead-only."), "Map the auth flow.");
   });
 });

@@ -52,10 +52,35 @@ function clip(text: string, max = 200): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-/** Assignment text without the "Complete assignment thoroughly:" boilerplate. */
-function taskBody(text: string): string {
+/**
+ * A readable one-line summary of an assignment. OMP assignments follow
+ * "# Target / # Change / # Acceptance"; the "Change" section says what the
+ * agent does, so it leads, and the heading markers never reach the UI.
+ */
+export function taskBody(text: string): string {
   const at = text.indexOf(TASK_MARKER);
-  return at === -1 ? text : text.slice(at + TASK_MARKER.length);
+  const body = at === -1 ? text : text.slice(at + TASK_MARKER.length);
+  const sections = new Map<string, string>();
+  let name: string | null = null;
+  let buffer: string[] = [];
+  const flush = () => {
+    if (name !== null) sections.set(name, buffer.join(" ").trim());
+  };
+  // Headings may sit on their own line or inline ("# Target x. # Change y.").
+  for (const part of body.split(/(?:^|\s)#{1,3}\s+(?=[A-Za-z])/m)) {
+    const match = /^(Target|Change|Acceptance|Goal|Constraints)\b[:\s]*([\s\S]*)$/.exec(part);
+    if (match === null) {
+      buffer.push(part.trim());
+      continue;
+    }
+    flush();
+    name = (match[1] ?? "").toLowerCase();
+    buffer = [(match[2] ?? "").trim()];
+  }
+  flush();
+  const lead = sections.get("change") ?? sections.get("goal") ?? sections.get("target");
+  const picked = lead !== undefined && lead !== "" ? lead : body.replace(/#{1,3}\s+/g, "");
+  return picked.replace(/\s+/g, " ").trim();
 }
 
 /** One short line from a tool's args: the path/command/query it worked on. */

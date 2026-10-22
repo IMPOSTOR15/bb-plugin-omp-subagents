@@ -159,11 +159,9 @@ const AGENT_JSONL = /^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/;
 
 async function listAgentFiles(artifactsDir: string): Promise<Array<{ file: string; id: string; mtimeMs: number }>> {
   const out: Array<{ file: string; id: string; mtimeMs: number }> = [];
-  const dirQueue = [artifactsDir];
-  let depthBudget = 2;
-  while (dirQueue.length > 0 && depthBudget > 0) {
-    depthBudget -= 1;
-    const dir = dirQueue.shift()!;
+  // The session dir plus EVERY subdirectory: each parent agent that spawned
+  // children has its own folder (<Parent>/<Parent>.<Child>.jsonl).
+  for (const dir of await agentDirs(artifactsDir)) {
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -171,10 +169,6 @@ async function listAgentFiles(artifactsDir: string): Promise<Array<{ file: strin
       continue;
     }
     for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (dir === artifactsDir) dirQueue.push(join(dir, entry.name));
-        continue;
-      }
       if (!entry.isFile() || !AGENT_JSONL.test(entry.name)) continue;
       if (entry.name === "__advisor.jsonl") continue;
       const file = join(dir, entry.name);

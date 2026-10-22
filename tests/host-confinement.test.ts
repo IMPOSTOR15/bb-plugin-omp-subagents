@@ -31,6 +31,8 @@ before(async () => {
   await writeFile(join(session, "AgentA.jsonl"), "{}\n");
   await writeFile(join(session, "AgentA.md"), "out\n");
   await writeFile(`${session}.jsonl`, "{}\n");
+  await mkdir(join(session, "Other"), { recursive: true });
+  await writeFile(join(session, "Other", "Other.Kid.jsonl"), "{}\n");
   await mkdir(join(session, "Parent"), { recursive: true });
   await writeFile(join(session, "Parent", "Parent.Child.jsonl"), "{}\n");
   await writeFile(join(session, "Parent", "Parent.Child.md"), "child out\n");
@@ -75,7 +77,7 @@ describe("host confinement", () => {
     const result = (await handlers.agents_list!({ artifactsDir: session }, ctx)) as {
       agents: Array<{ id: string }>;
     };
-    assert.deepEqual(result.agents.map((a) => a.id).sort(), ["AgentA", "Parent.Child"]);
+    assert.deepEqual(result.agents.map((a) => a.id).sort(), ["AgentA", "Other.Kid", "Parent.Child"]);
   });
 
   it("reads transcript and output of a nested agent from its subdirectory", async () => {

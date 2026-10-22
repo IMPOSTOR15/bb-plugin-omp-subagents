@@ -16,6 +16,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 // The sessions root is read per call, so a static import is safe here.
 import host from "../src/host.ts";
 import { parseAgentFile, parseLatestTaskAgents, parseTranscript } from "../src/omp.ts";
+import { activityLine } from "../src/activity.ts";
 import { spawnedIdsFromOutput } from "../src/spawn.ts";
 
 type Handler = (input: unknown, context?: unknown) => Promise<unknown>;
@@ -267,5 +268,24 @@ describe("parseLatestTaskAgents", () => {
       result("c2", "- `New` (job `New`)"),
     ]);
     assert.deepEqual([...ids], ["New"]);
+  });
+});
+
+describe("activityLine", () => {
+  const base = { status: "running" as const, task: "audit the parser", currentTool: "grep", currentToolIntent: "status enum" };
+  it("shows tool and intent for a running agent", () => {
+    assert.equal(activityLine(base), "grep: status enum");
+  });
+  it("never ends in a dangling colon when the intent is empty", () => {
+    assert.equal(activityLine({ ...base, currentToolIntent: "  " }), "grep");
+    assert.equal(activityLine({ ...base, currentToolIntent: null }), "grep");
+  });
+  it("shows waiting for wait/yield and for no tool yet", () => {
+    assert.equal(activityLine({ ...base, currentTool: "wait", currentToolIntent: "" }), "waiting");
+    assert.equal(activityLine({ ...base, currentTool: "yield" }), "waiting");
+    assert.equal(activityLine({ ...base, currentTool: null }), "waiting");
+  });
+  it("shows the task, not the last tool, once the agent settled", () => {
+    assert.equal(activityLine({ ...base, status: "finished" }), "audit the parser");
   });
 });

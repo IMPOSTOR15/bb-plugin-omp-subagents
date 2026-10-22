@@ -10,6 +10,7 @@
 import { createRoot, type Root } from "react-dom/client";
 import { createElement, useEffect, useRef, useState } from "react";
 import type { AgentSummary } from "./contract.ts";
+import { activityLine } from "./activity.ts";
 import { spawnedIdsFromOutput } from "./spawn.ts";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
@@ -102,17 +103,6 @@ function readTaskRow(element: Element): TaskRow | null {
 
 // ---- The strip --------------------------------------------------------------
 
-/** The one-line activity label for a strip row. */
-function activityText(agent: AgentSummary): string {
-  if (agent.status !== "running") return `${agent.toolCount} tools`;
-  const tool = agent.currentTool;
-  if (tool === null || tool === "wait" || tool === "yield") {
-    return "waiting";
-  }
-  const intent = agent.currentToolIntent;
-  return intent === null || intent.trim() === "" ? tool : `${tool} ${intent}`;
-}
-
 function AgentStripLine({ agent }: { agent: AgentSummary }) {
   const tone =
     agent.status === "failed"
@@ -146,7 +136,7 @@ function AgentStripLine({ agent }: { agent: AgentSummary }) {
         {agent.id}
       </span>
       <span className="truncate text-2xs text-muted-foreground">
-        {activityText(agent)}
+        {agent.status === "running" ? activityLine(agent) : `${agent.toolCount} tools`}
       </span>
     </span>
   );

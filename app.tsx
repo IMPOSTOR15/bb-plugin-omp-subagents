@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import "./src/theme.css";
+import { activityLine } from "./src/activity.ts";
 import { startTimelineStrip } from "./src/timeline.tsx";
 import {
   definePluginApp,
@@ -268,9 +269,7 @@ function AgentRow({
         <span className="shrink-0">{formatCost(agent.costTotal)}</span>
       </div>
       <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-        {agent.currentTool !== null
-          ? `${agent.currentTool}: ${agent.currentToolIntent ?? ""}`
-          : agent.task}
+        {activityLine(agent)}
       </p>
     </button>
   );

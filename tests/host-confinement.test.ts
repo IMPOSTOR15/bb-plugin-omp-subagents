@@ -15,7 +15,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 
 // The sessions root is read per call, so a static import is safe here.
 import host from "../src/host.ts";
-import { parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
+import { clipBody, parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
 import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
 import { GLYPHS, VERIFIED_BB_GLYPHS } from "../src/glyphs.ts";
@@ -484,5 +484,26 @@ describe("opening an agent from the strip", () => {
     for (const [use, name] of Object.entries(GLYPHS)) {
       assert.ok((VERIFIED_BB_GLYPHS as readonly string[]).includes(name), `${use} uses unverified glyph ${name}`);
     }
+  });
+});
+
+describe("transcript bodies keep their structure", () => {
+  const md = "## Findings\n\n- first issue\n- second issue\n\nDone.";
+  it("clipBody keeps line breaks and list markers", () => {
+    assert.equal(clipBody(md, 500), md);
+  });
+  it("clipBody collapses runs of blank lines and CRLF, and trims", () => {
+    assert.equal(clipBody("a\r\n\r\n\r\n\r\nb\n\n\n\nc  ", 500), "a\n\nb\n\nc");
+  });
+  it("clipBody cuts on code points with an ellipsis", () => {
+    const out = clipBody("👍".repeat(50), 10);
+    assert.equal(Array.from(out).length, 10);
+    assert.ok(out.endsWith("…") && !out.includes("\ufffd"));
+  });
+  it("an assistant message keeps its Markdown in the transcript body, while the summary stays one line", () => {
+    const line = JSON.stringify({ type: "message", timestamp: new Date(1_000_000).toISOString(), message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: md }] } });
+    const { entries } = parseTranscript([line]);
+    assert.equal(entries[0]!.text, md);
+    assert.ok(!entries[0]!.summary.includes("\n"));
   });
 });

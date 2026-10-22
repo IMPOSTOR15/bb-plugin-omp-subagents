@@ -47,6 +47,17 @@ function textFromContent(content: unknown): string {
   return parts.join("");
 }
 
+/**
+ * Cut `text` to at most `max` code points, keeping its line breaks. Used for
+ * transcript bodies, which are rendered as Markdown: flattening them would
+ * turn a list or a paragraph into one run-on line.
+ */
+export function clipBody(text: string, max: number): string {
+  const trimmed = text.replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  const points = Array.from(trimmed);
+  return points.length <= max ? trimmed : `${points.slice(0, max - 1).join("").trimEnd()}…`;
+}
+
 function clip(text: string, max = 200): string {
   const flat = text.replace(/\s+/g, " ").trim();
   // Count code points, not UTF-16 units: a cut must never split an emoji.
@@ -424,7 +435,7 @@ export function parseTranscript(lines: readonly string[]): {
           t,
           role: "user",
           summary: clip(text, 300),
-          text: clip(text, 2000),
+          text: clipBody(text, 2000),
           toolName: null,
           intent: null,
           tokensIn: null,
@@ -454,7 +465,7 @@ export function parseTranscript(lines: readonly string[]): {
               t,
               role: "assistant",
               summary: clip(p.text, 300),
-              text: clip(p.text, 4000),
+              text: clipBody(p.text, 4000),
               toolName: null,
               intent: null,
               tokensIn: usage.input,
@@ -470,7 +481,7 @@ export function parseTranscript(lines: readonly string[]): {
           t,
           role: "toolResult",
           summary: clip(text, 160),
-          text: clip(text, 4000),
+          text: clipBody(text, 4000),
           toolName: typeof m.toolName === "string" ? m.toolName : null,
           intent: null,
           tokensIn: null,
@@ -487,7 +498,7 @@ export function parseTranscript(lines: readonly string[]): {
         t,
         role: "irc",
         summary: clip(content, 300),
-        text: clip(content, 3000),
+        text: clipBody(content, 3000),
         toolName: null,
         intent: null,
         tokensIn: null,

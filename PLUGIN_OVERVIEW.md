@@ -6,7 +6,8 @@ shows them in BB.
 
 - **A strip under every spawn.** Below each `task` row, one line per agent:
   status glyph, name, and what it is doing now. It stays after the agents
-  finish, with each agent's final status and tool count.
+  finish, with each agent's final status and tool count. Click an agent to
+  open its history in the side panel.
 - **A roster panel.** The `N subagents` chip in the thread header opens every
   agent of the thread with its status, model, tools, tokens, cost, and latest
   action. Open an agent to read its transcript or final output.

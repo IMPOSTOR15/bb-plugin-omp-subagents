@@ -49,7 +49,9 @@ function textFromContent(content: unknown): string {
 
 function clip(text: string, max = 200): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+  // Count code points, not UTF-16 units: a cut must never split an emoji.
+  const points = Array.from(flat);
+  return points.length <= max ? flat : `${points.slice(0, max - 1).join("")}…`;
 }
 
 /**
@@ -165,6 +167,9 @@ export function parseAgentFile(
   let lastContextTokens: number | null = null;
   let lastStopReason: string | null = null;
   let lastAssistantHadToolCall = false;
+  let yieldCalled = false;
+  let yieldAccepted = false;
+  let lastError: string | null = null;
   let exitReason: string | null = null;
 
   for (const line of lines) {
@@ -206,12 +211,18 @@ export function parseAgentFile(
         if (usage.contextTokens !== null) lastContextTokens = usage.contextTokens;
         lastStopReason = typeof m.stopReason === "string" ? m.stopReason : null;
         lastAssistantHadToolCall = false;
+        yieldCalled = false;
+        yieldAccepted = false;
+        if (m.stopReason === "error" && typeof m.errorMessage === "string") {
+          lastError = clip(m.errorMessage, 160);
+        }
         if (Array.isArray(m.content)) {
           for (const part of m.content) {
             if (part === null || typeof part !== "object") continue;
             const p = part as Record<string, unknown>;
             if (p.type === "toolCall") {
               lastAssistantHadToolCall = true;
+              if (p.name === "yield") yieldCalled = true;
               toolCount += 1;
               currentTool = typeof p.name === "string" ? p.name : currentTool;
               if (typeof p.intent === "string") {
@@ -223,6 +234,11 @@ export function parseAgentFile(
           }
         }
       } else if (m.role === "toolResult" || m.role === "user") {
+        // `yield` is how a subagent hands its result back: once accepted the
+        // agent is done, even though OMP writes no session_exit until it parks.
+        if (m.role === "toolResult" && m.toolName === "yield" && m.isError !== true) {
+          yieldAccepted = yieldCalled;
+        }
         // Work resumed after the last assistant turn: it is not a final turn.
         lastAssistantHadToolCall = lastAssistantHadToolCall || m.role === "toolResult";
         if (m.role === "user") lastStopReason = null;
@@ -250,6 +266,7 @@ export function parseAgentFile(
       if (ms !== null) lastActivityAtMs = ms;
       lastStopReason = null;
       lastAssistantHadToolCall = false;
+      yieldAccepted = false;
     }
   }
 
@@ -258,7 +275,7 @@ export function parseAgentFile(
   // OMP keeps a finished subagent's session open (it parks it later), so a
   // clean end is the transcript's own final turn, not a `session_exit` row.
   const settledTurn =
-    lastStopReason === "stop" && !lastAssistantHadToolCall;
+    yieldAccepted || (lastStopReason === "stop" && !lastAssistantHadToolCall);
   const aborted = lastStopReason === "aborted";
   const failedTurn = lastStopReason === "error" || lastStopReason === "length";
   const exited = endedAtMs !== null;
@@ -277,9 +294,7 @@ export function parseAgentFile(
         ? "unread-success"
         : status === "failed"
           ? "unread-error"
-          : status === "interrupted"
-            ? "waiting-for-input"
-            : "none";
+          : "none";
 
   const from = createdAtMs ?? lastActivityAtMs ?? mtimeMs;
   const to = lastActivityAtMs ?? mtimeMs;
@@ -310,6 +325,7 @@ export function parseAgentFile(
     nested: [],
     activeSeconds,
     indicator,
+    error: status === "failed" ? lastError : null,
     spawnedInLatestBatch: false, // caller sets from the parent's newest batch
   };
 }

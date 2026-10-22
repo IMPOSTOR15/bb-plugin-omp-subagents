@@ -12,7 +12,7 @@ them where you are looking.
 - **A strip under every spawn.** Below each `task` row in the dialog, one line
   per agent: status glyph, name, and what it is doing now (current tool and
   intent while it runs, tool count after it settles). It stays after the
-  agents finish.
+  agents finish. Click an agent to open its history in the side panel.
 - **A roster panel.** The header chip `N subagents` opens a side panel with
   every agent of the thread: status, agent type, model, tools, tokens, cost,
   and its latest action. Open one to read its transcript or its final output.

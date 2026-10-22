@@ -47,6 +47,8 @@ export const agentSummarySchema = z.object({
   nested: z.array(z.string()),
   activeSeconds: z.number().nullable(),
   indicator: agentIndicatorSchema,
+  /** Why a failed agent failed (its last provider error), else null. */
+  error: z.string().nullable(),
   spawnedInLatestBatch: z.boolean(),
 });
 

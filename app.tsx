@@ -11,6 +11,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import "./src/theme.css";
 import { activityLine } from "./src/activity.ts";
+import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "./src/open-agent.ts";
+import { statusStyle } from "./src/status-style.ts";
 import { startTimelineStrip } from "./src/timeline.tsx";
 import {
   definePluginApp,
@@ -113,21 +115,6 @@ function formatCost(cost: number | null): string {
 
 // ---- Status glyph: bb's own vocabulary -------------------------------------
 
-function agentIndicatorClass(agent: AgentSummary): string {
-  switch (agent.status) {
-    case "running":
-      return "text-[color:var(--bb-omp-tone-working)]";
-    case "finished":
-      return "text-[color:var(--bb-omp-tone-success)]";
-    case "failed":
-      return "text-[color:var(--bb-omp-tone-error)]";
-    case "interrupted":
-      return "text-[color:var(--bb-omp-tone-pending)]";
-    default:
-      return "text-[color:var(--bb-omp-tone-working)]";
-  }
-}
-
 // ---- Header chip -------------------------------------------------------------
 
 function AgentCountChip({
@@ -178,6 +165,24 @@ function HeaderChip({
   const navigate = useBbNavigate();
   const agents = roster?.agents ?? [];
   const running = agents.filter((agent) => agent.status === "running").length;
+
+  // A click on an agent in the timeline strip: open that agent's history here.
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const request = parseOpenAgentRequest(
+        event instanceof CustomEvent ? event.detail : null,
+      );
+      if (request === null || request.threadId !== threadId) return;
+      navigate.openThreadPanel({
+        actionId: "hub",
+        title: request.agentId,
+        params: { threadId, projectId, agentId: request.agentId },
+      });
+    };
+    window.addEventListener(OPEN_AGENT_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_AGENT_EVENT, onOpen);
+  }, [navigate, threadId, projectId]);
+
   if (agents.length === 0) return null;
   return (
     <AgentCountChip
@@ -208,6 +213,19 @@ function EmptyState({ children }: { children: ReactNode }) {
   );
 }
 
+function StatusIcon({ status, size = "size-3.5" }: { status: AgentSummary["status"]; size?: string }) {
+  const style = statusStyle(status);
+  return (
+    <span className={cn("shrink-0", style.toneClass)} title={style.label}>
+      <Icon
+        name={style.glyph}
+        aria-label={style.label}
+        className={cn(size, style.spin && "animate-spin opacity-75")}
+      />
+    </span>
+  );
+}
+
 function AgentRow({
   agent,
   selected,
@@ -229,24 +247,7 @@ function AgentRow({
       )}
     >
       <div className="flex items-center gap-2">
-        <span className={cn("shrink-0", agentIndicatorClass(agent))}>
-          {agent.status === "running" ? (
-            <Icon name="Loading" className="size-3.5 animate-spin opacity-75" />
-          ) : (
-            <Icon
-              name={
-                agent.status === "failed"
-                  ? "CircleX"
-                  : agent.status === "interrupted"
-                    ? "CirclePause"
-                    : agent.status === "finished"
-                      ? "CircleCheck"
-                      : "CircleDashed"
-              }
-              className="size-3.5"
-            />
-          )}
-        </span>
+        <StatusIcon status={agent.status} />
         <span className="min-w-0 flex-1 truncate text-sm font-medium">
           {agent.id}
         </span>
@@ -499,14 +500,15 @@ function HubPanel({
   threadId: string;
   params: unknown;
 }) {
-  const targetThreadId =
-    params !== null && typeof params === "object" && "threadId" in params &&
-    typeof (params as { threadId: unknown }).threadId === "string"
-      ? (params as { threadId: string }).threadId
-      : threadId;
+  const hubParams = parseHubParams(params);
+  const targetThreadId = hubParams.threadId ?? threadId;
   const rpc = useRpc<typeof rpcContract>();
   const { roster, error, loading, refetch } = useAgentRoster(targetThreadId);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(hubParams.agentId);
+  // The same tab can be re-pointed at another agent by new params.
+  useEffect(() => {
+    setSelectedId(hubParams.agentId);
+  }, [hubParams.agentId]);
   const [injectText, setInjectText] = useState("");
   const [injecting, setInjecting] = useState(false);
 

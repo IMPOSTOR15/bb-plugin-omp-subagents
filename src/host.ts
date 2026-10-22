@@ -3,7 +3,7 @@
 // Runs inside the host daemon on each enrolled machine. It owns every read of
 // the OMP session tree and emits `changed` signals whenever a watched session's
 // files change, so live rosters update in BB without polling loops.
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -17,6 +17,7 @@ import {
   parseTranscript,
 } from "./omp.ts";
 import { hostContract, hostSignals } from "./contract.ts";
+import { readHead, readLines, regularFileSize } from "./bounded-read.ts";
 import type { AgentSummary } from "./contract.ts";
 
 // Matches the contract's sessions_list `limit` ceiling.
@@ -70,18 +71,6 @@ function sessionsRoot(): string {
   return process.env.OMP_SESSIONS_DIR ?? join(homedir(), ".omp/agent/sessions");
 }
 
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
-
-/** A regular file (never a symlink) of bounded size, or null. */
-async function regularFileSize(path: string): Promise<number | null> {
-  try {
-    const st = await lstat(path);
-    return st.isFile() && st.size <= MAX_FILE_BYTES ? st.size : null;
-  } catch {
-    return null;
-  }
-}
-
 async function pathExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -89,21 +78,6 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function readLines(path: string, maxBytes: number): Promise<string[]> {
-  if ((await regularFileSize(path)) === null) throw new UnsafePathError("not a regular file");
-  const content = await readFile(path, "utf8");
-  if (content.length <= maxBytes) return content.split("\n");
-  // Oversized transcript: keep the head (session_init + assignment) and the
-  // live tail; the middle is history the transcript view pages over anyway.
-  const lines = content.split("\n");
-  const avg = content.length / lines.length;
-  const tailCount = Math.max(1, Math.floor(maxBytes / 2 / avg));
-  // Never let the tail reach back into the head: that would repeat lines.
-  const headEnd = Math.min(40, lines.length);
-  const tailStart = Math.max(headEnd, lines.length - tailCount);
-  return [...lines.slice(0, headEnd), ...lines.slice(tailStart)];
 }
 
 type SessionEntry = {
@@ -209,16 +183,51 @@ async function readAgent(
 }
 
 /** The directories an agent's files may live in: the session dir and its subdirs. */
+const MAX_AGENT_DIR_DEPTH = 4;
+const MAX_AGENT_DIRS = 200;
+
+/**
+ * The session dir and its subdirectories, breadth-first: each parent that
+ * spawned children has a folder, and grandchildren nest deeper. Capped on depth
+ * and count; symlinked directories are never entered (`Dirent.isDirectory()`
+ * is false for a symlink).
+ */
 async function agentDirs(confined: string): Promise<string[]> {
   const dirs = [confined];
-  try {
-    for (const entry of await readdir(confined, { withFileTypes: true })) {
-      if (entry.isDirectory()) dirs.push(join(confined, entry.name));
+  let level = [confined];
+  for (let depth = 0; depth < MAX_AGENT_DIR_DEPTH && level.length > 0; depth += 1) {
+    const next: string[] = [];
+    for (const dir of level) {
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || dirs.length >= MAX_AGENT_DIRS) continue;
+        const child = join(dir, entry.name);
+        dirs.push(child);
+        next.push(child);
+      }
     }
-  } catch {
-    // unreadable: the session dir itself still applies
+    level = next;
   }
   return dirs;
+}
+
+/** Run `fn` over `items` with at most `limit` in flight; results keep input order. */
+async function mapPool<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      for (let index = next++; index < items.length; index = next++) {
+        results[index] = await fn(items[index]!);
+      }
+    }),
+  );
+  return results;
 }
 
 async function readParentTaskBatch(
@@ -318,9 +327,9 @@ export default experimental_defineHostEntry({
         listAgentFiles(confined),
         readParentTaskBatch(sessionFile),
       ]);
-      const agents = (
-        await Promise.all(agentFiles.map((info) => readAgent(info)))
-      ).flatMap((agent) => (agent === null ? [] : [agent]));
+      const agents = (await mapPool(agentFiles, 8, readAgent)).flatMap((agent) =>
+        agent === null ? [] : [agent],
+      );
       // lineage: "Parent.Child" ids nest under "Parent"
       const nestedByParent = new Map<string, string[]>();
       for (const agent of agents) {
@@ -366,8 +375,10 @@ export default experimental_defineHostEntry({
         for (const kind of ["json", "md"] as const) {
           const file = join(dir, `${id}.${kind}`);
           if ((await regularFileSize(file)) === null) continue;
-          const content = await readFile(file, "utf8");
-          return { kind, ...clipOutput(content) };
+          const head = await readHead(file, 256 * 1024);
+          if (head === null) continue;
+          const clipped = clipOutput(head.text);
+          return { kind, content: clipped.content, truncated: clipped.truncated || head.truncated };
         }
       }
       throw new Error(`No output artifact for agent ${id}`);

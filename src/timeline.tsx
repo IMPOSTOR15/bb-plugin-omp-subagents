@@ -11,11 +11,16 @@ import { createRoot, type Root } from "react-dom/client";
 import { createElement, useEffect, useRef, useState } from "react";
 import type { AgentSummary } from "./contract.ts";
 import { activityLine } from "./activity.ts";
+import { OPEN_AGENT_EVENT } from "./open-agent.ts";
+import { statusStyle } from "./status-style.ts";
 import { spawnedIdsFromOutput } from "./spawn.ts";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
 /** The React fiber key prefix the React 19 build mangles onto DOM nodes. */
+/** The id the build scopes this plugin's CSS utilities to. */
+const PLUGIN_ID = "omp-subagents";
+
 const REACT_FIBER_PREFIX = "__reactFiber$";
 
 type TimelineRowObject = {
@@ -103,42 +108,37 @@ function readTaskRow(element: Element): TaskRow | null {
 
 // ---- The strip --------------------------------------------------------------
 
-function AgentStripLine({ agent }: { agent: AgentSummary }) {
-  const tone =
-    agent.status === "failed"
-      ? "text-[color:var(--bb-omp-tone-error)]"
-      : agent.status === "interrupted"
-        ? "text-[color:var(--bb-omp-tone-pending)]"
-        : agent.status === "finished"
-          ? "text-[color:var(--bb-omp-tone-success)]"
-          : "text-[color:var(--bb-omp-tone-working)]";
+function AgentStripLine({ agent, threadId }: { agent: AgentSummary; threadId: string }) {
+  const style = statusStyle(agent.status);
   return (
-    <span className="flex min-w-0 items-center gap-1.5">
-      <span className={cn("shrink-0", tone)}>
-        {agent.status === "running" ? (
-          <Icon name="Loading" className="size-3 animate-spin opacity-75" />
-        ) : (
-          <Icon
-            name={
-              agent.status === "failed"
-                ? "CircleX"
-                : agent.status === "interrupted"
-                  ? "CirclePause"
-                  : agent.status === "finished"
-                    ? "CircleCheck"
-                    : "CircleDashed"
-            }
-            className="size-3"
-          />
-        )}
+    <button
+      type="button"
+      onClick={() =>
+        window.dispatchEvent(
+          new CustomEvent(OPEN_AGENT_EVENT, { detail: { threadId, agentId: agent.id } }),
+        )
+      }
+      title={`${style.label}: open ${agent.id} history`}
+      aria-label={`Open ${agent.id} history (${style.label})`}
+      className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm px-1 py-px text-left hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:outline-none"
+    >
+      <span className={cn("shrink-0", style.toneClass)}>
+        <Icon
+          name={style.glyph}
+          className={cn("size-3", style.spin && "animate-spin opacity-75")}
+        />
       </span>
       <span className="shrink-0 text-xs font-medium text-foreground">
         {agent.id}
       </span>
       <span className="truncate text-2xs text-muted-foreground">
-        {agent.status === "running" ? activityLine(agent) : `${agent.toolCount} tools`}
+        {agent.status === "running" || agent.status === "failed"
+          ? activityLine(agent)
+          : agent.status === "interrupted"
+            ? "interrupted"
+            : `${agent.toolCount} tools`}
       </span>
-    </span>
+    </button>
   );
 }
 
@@ -199,10 +199,10 @@ function TaskStrip({ row }: { row: TaskRow }) {
   return (
     <div
       role="status"
-      className="omp-subagent-strip pointer-events-none mx-1 mt-0.5 mb-1 flex flex-col gap-0.5 border-l-2 border-border pl-2"
+      className="omp-subagent-strip mx-1 mt-0.5 mb-1 flex flex-col items-start gap-0.5 border-l-2 border-border pl-2"
     >
       {agents.map((agent) => (
-        <AgentStripLine key={agent.id} agent={agent} />
+        <AgentStripLine key={agent.id} agent={agent} threadId={row.threadId} />
       ))}
     </div>
   );
@@ -222,6 +222,9 @@ export function startTimelineStrip(signal: AbortSignal): void {
     if (mounts.has(element)) return;
     const host = document.createElement("div");
     host.className = "omp-subagent-strip-host contents";
+    // Plugin utilities are scoped to this attribute; the timeline lives outside
+    // any plugin wrapper, so without it none of the strip's classes apply.
+    host.setAttribute("data-bb-plugin", PLUGIN_ID);
     element.insertAdjacentElement("afterend", host);
     const root = createRoot(host);
     root.render(createElement(TaskStrip, { row: taskRow }));

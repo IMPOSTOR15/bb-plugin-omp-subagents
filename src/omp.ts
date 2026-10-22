@@ -78,8 +78,15 @@ export function taskBody(text: string): string {
     buffer = [(match[2] ?? "").trim()];
   }
   flush();
-  const lead = sections.get("change") ?? sections.get("goal") ?? sections.get("target");
-  const picked = lead !== undefined && lead !== "" ? lead : body.replace(/#{1,3}\s+/g, "");
+  // "# Change None. Read the file." says the agent changes nothing, then what
+  // it does. The "None." opener carries no information: drop it, keep the rest,
+  // and skip the section entirely when nothing else follows.
+  const withoutNone = (value: string | undefined): string =>
+    (value ?? "").replace(/^\s*(?:none|n\/a|nothing|no changes?)\b\.?\s*/i, "").trim();
+  const lead = ["change", "goal", "target"]
+    .map((key) => withoutNone(sections.get(key)))
+    .find((value) => value !== "");
+  const picked = lead ?? body.replace(/#{1,3}\s+/g, "");
   return picked.replace(/\s+/g, " ").trim();
 }
 

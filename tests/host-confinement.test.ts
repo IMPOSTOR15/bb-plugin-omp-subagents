@@ -304,6 +304,12 @@ describe("taskBody", () => {
   it("falls back to the plain text when there are no headings", () => {
     assert.equal(taskBody("Fix the flaky   login test"), "Fix the flaky login test");
   });
+  it("drops a leading None. and keeps what the agent does", () => {
+    assert.equal(taskBody("# Target src/omp.ts (read-only). # Change None. Read the file. # Acceptance Done."), "Read the file.");
+  });
+  it("skips a Change section that is only None and leads with the Target", () => {
+    assert.equal(taskBody("# Target\nserver.ts\n# Change\nNone\n# Acceptance\nok"), "server.ts");
+  });
   it("uses the Goal when there is no Change", () => {
     assert.equal(taskBody("# Goal\nMap the auth flow.\n# Constraints\nRead-only."), "Map the auth flow.");
   });

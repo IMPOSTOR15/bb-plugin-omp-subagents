@@ -8,6 +8,7 @@
 //     local/, N.bash.log, async.log, …            shared tool artifacts
 //
 // Row shapes are untrusted input: every read is guarded, nothing is assumed.
+import { spawnedIdsFromOutput } from "./spawn.ts";
 import type {
   AgentStatus,
   AgentIndicator,
@@ -212,8 +213,11 @@ export function parseAgentFile(
       continue;
     }
     if (row.type === "custom_message" && row.customType === "irc:incoming") {
+      // Steering input reopens a settled agent: it is live until it answers.
       const ms = rowTime(row);
-      if (ms !== null) lastActivityAtMs ??= ms;
+      if (ms !== null) lastActivityAtMs = ms;
+      lastStopReason = null;
+      lastAssistantHadToolCall = false;
     }
   }
 
@@ -278,9 +282,15 @@ export function parseAgentFile(
   };
 }
 
-/** Agent ids assigned in the parent's most recent `task` toolCall. */
+/**
+ * Agent ids assigned in the parent's most recent `task` toolCall. The spawn
+ * result is authoritative (OMP renames a taken name to `Name-2`); the
+ * requested names are the fallback while that result has not been written.
+ */
 export function parseLatestTaskAgents(lines: readonly string[]): Set<string> {
-  let latestNames: string[] | null = null;
+  let latestCallId: string | null = null;
+  let latestNames: string[] = [];
+  let latestSpawned: string[] = [];
   for (const line of lines) {
     let row: OmpRow;
     try {
@@ -292,11 +302,19 @@ export function parseLatestTaskAgents(lines: readonly string[]): Set<string> {
     const message = row.message;
     if (message === null || typeof message !== "object") continue;
     const m = message as Record<string, unknown>;
+    if (m.role === "toolResult") {
+      if (m.toolName === "task" && m.toolCallId === latestCallId) {
+        latestSpawned = spawnedIdsFromOutput(textFromContent(m.content));
+      }
+      continue;
+    }
     if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
     for (const part of m.content) {
       if (part === null || typeof part !== "object") continue;
       const p = part as Record<string, unknown>;
       if (p.type !== "toolCall" || p.name !== "task") continue;
+      latestCallId = typeof p.id === "string" ? p.id : null;
+      latestSpawned = [];
       const args = p.arguments;
       const tasks =
         args !== null && typeof args === "object" && "tasks" in args
@@ -311,7 +329,7 @@ export function parseLatestTaskAgents(lines: readonly string[]): Set<string> {
         : [];
     }
   }
-  return new Set(latestNames ?? []);
+  return new Set(latestSpawned.length > 0 ? latestSpawned : latestNames);
 }
 
 const MAX_TRANSCRIPT_ENTRIES = 500;

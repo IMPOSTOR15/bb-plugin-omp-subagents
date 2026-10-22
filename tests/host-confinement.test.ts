@@ -15,7 +15,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 
 // The sessions root is read per call, so a static import is safe here.
 import host from "../src/host.ts";
-import { parseAgentFile, parseTranscript } from "../src/omp.ts";
+import { parseAgentFile, parseLatestTaskAgents, parseTranscript } from "../src/omp.ts";
 import { spawnedIdsFromOutput } from "../src/spawn.ts";
 
 type Handler = (input: unknown, context?: unknown) => Promise<unknown>;
@@ -178,6 +178,12 @@ describe("parseAgentFile status", () => {
     const a = parseAgentFile("x", [finalText(now - 3000), toolResult(now - 1000)], now - 1000, now, artifacts);
     assert.equal(a.status, "running");
   });
+  it("incoming steering after a final turn makes the agent running again", () => {
+    const irc = JSON.stringify({ type: "custom_message", customType: "irc:incoming", timestamp: ts(now - 2000), content: "<irc>go on</irc>" });
+    const a = parseAgentFile("x", [finalText(now - 20_000), irc], now - 2000, now, artifacts);
+    assert.equal(a.status, "running");
+    assert.equal(a.lastActivityAtMs, now - 2000);
+  });
   it("an orphaned agent has no runtime indicator", () => {
     const a = parseAgentFile("x", [toolCall(now - 900_000)], now - 900_000, now, artifacts);
     assert.equal(a.status, "partial");
@@ -232,5 +238,32 @@ describe("host watch registration", () => {
       handlers.agents_list!({ artifactsDir: session }, slowCtx),
     ]);
     assert.equal(started, 1);
+  });
+});
+
+describe("parseLatestTaskAgents", () => {
+  const call = (id: string, names: string[]) =>
+    JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "task", arguments: { tasks: names.map((name) => ({ name })) } }] } });
+  const result = (id: string, text: string) =>
+    JSON.stringify({ type: "message", message: { role: "toolResult", toolName: "task", toolCallId: id, content: [{ type: "text", text }] } });
+
+  it("uses the uniquified id from the spawn result, not the requested name", () => {
+    const ids = parseLatestTaskAgents([
+      call("c1", ["Scout"]),
+      result("c1", "Spawned agent.\n- `Scout-2` (job `Scout-2`)"),
+    ]);
+    assert.deepEqual([...ids], ["Scout-2"]);
+  });
+  it("falls back to requested names until the spawn result is written", () => {
+    assert.deepEqual([...parseLatestTaskAgents([call("c1", ["Scout"])])], ["Scout"]);
+  });
+  it("only the latest batch counts", () => {
+    const ids = parseLatestTaskAgents([
+      call("c1", ["Old"]),
+      result("c1", "- `Old` (job `Old`)"),
+      call("c2", ["New"]),
+      result("c2", "- `New` (job `New`)"),
+    ]);
+    assert.deepEqual([...ids], ["New"]);
   });
 });

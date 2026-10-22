@@ -103,6 +103,20 @@ describe("host confinement", () => {
     assert.equal(new Set(messages).size, 1);
   });
 
+  it("an oversized transcript keeps head and tail without repeating a line", async () => {
+    // 45 short lines, then padded past the byte limit so the splice applies.
+    const rows = Array.from({ length: 45 }, (_, i) =>
+      JSON.stringify({ type: "message", timestamp: new Date(2_000_000 + i * 1000).toISOString(), message: { role: "user", content: `row-${i}-${"x".repeat(60_000)}` } }),
+    );
+    await writeFile(join(session, "Big.jsonl"), rows.join("\n") + "\n");
+    const result = (await handlers.agent_transcript!({ artifactsDir: session, agentId: "Big" })) as {
+      entries: Array<{ summary: string }>;
+    };
+    const seen = result.entries.map((e) => e.summary.slice(0, 8));
+    assert.equal(new Set(seen).size, seen.length, "no entry may repeat");
+    assert.ok(seen.includes("row-44-x") || seen.some((s) => s.startsWith("row-44")));
+  });
+
   it("watch outside the root is refused, not started", async () => {
     const result = (await handlers.watch!({ path: "/etc" }, ctx)) as { watched: boolean };
     assert.equal(result.watched, false);
@@ -197,5 +211,26 @@ describe("spawnedIdsFromOutput", () => {
   it("returns nothing for a non-spawn output", () => {
     assert.deepEqual(spawnedIdsFromOutput("Task failed preflight: bad schema"), []);
     assert.deepEqual(spawnedIdsFromOutput(null), []);
+  });
+});
+
+describe("host watch registration", () => {
+  it("starts exactly one subscription for concurrent callers", async () => {
+    let started = 0;
+    const slowCtx = {
+      experimental_watch: async () => {
+        started += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { dispose: async () => undefined };
+      },
+      experimental_retainWorker: () => ({ dispose: async () => undefined }),
+      experimental_emitSignal: async () => undefined,
+    };
+    await Promise.all([
+      handlers.watch!({ path: session }, slowCtx),
+      handlers.watch!({ path: session }, slowCtx),
+      handlers.agents_list!({ artifactsDir: session }, slowCtx),
+    ]);
+    assert.equal(started, 1);
   });
 });

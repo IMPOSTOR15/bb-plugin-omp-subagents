@@ -171,7 +171,14 @@ function TaskStrip({ row }: { row: TaskRow }) {
         .then((envelope) => {
           observe(envelope);
           if (cancelled || !envelope.ok || envelope.result === undefined) return;
-          setAgents(envelope.result.agents.filter((agent) => names.has(agent.id)));
+          // Keep spawn order: the roster is sorted by activity, which would
+          // make the lines swap places on every poll.
+          const rank = new Map(row.agentNames.map((name, index) => [name, index]));
+          setAgents(
+            envelope.result.agents
+              .filter((agent) => names.has(agent.id))
+              .sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0)),
+          );
         })
         .catch(() => undefined);
     };

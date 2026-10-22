@@ -99,8 +99,11 @@ async function readLines(path: string, maxBytes: number): Promise<string[]> {
   // live tail; the middle is history the transcript view pages over anyway.
   const lines = content.split("\n");
   const avg = content.length / lines.length;
-  const tailCount = Math.max(1, Math.floor((maxBytes / 2) / avg));
-  return [...lines.slice(0, 40), ...lines.slice(-tailCount)];
+  const tailCount = Math.max(1, Math.floor(maxBytes / 2 / avg));
+  // Never let the tail reach back into the head: that would repeat lines.
+  const headEnd = Math.min(40, lines.length);
+  const tailStart = Math.max(headEnd, lines.length - tailCount);
+  return [...lines.slice(0, headEnd), ...lines.slice(tailStart)];
 }
 
 type SessionEntry = {
@@ -396,35 +399,50 @@ export default experimental_defineHostEntry({
   },
 });
 
+/** In-flight watch starts, so concurrent callers share one subscription. */
+const pendingWatches = new Map<string, Promise<void>>();
+
 async function startWatch(
   context: ExperimentalHostRpcContext<typeof hostSignals>,
   sessionUuid: string,
   artifactsDir: string,
 ): Promise<void> {
-  if (watches.has(watchKey(artifactsDir))) return;
-  const subscription = await context.experimental_watch(
-    {
-      rootPath: artifactsDir,
-      debounceMs: 400,
-      maxWaitMs: 1500,
-    },
-    async (event) => {
-      if (event.kind !== "changed") {
-        // rescan-required / watch-error: ask the server to refetch everything
+  const key = watchKey(artifactsDir);
+  if (watches.has(key)) return;
+  const inflight = pendingWatches.get(key);
+  if (inflight !== undefined) return inflight;
+  const created = (async () => {
+    const subscription = await context.experimental_watch(
+      {
+        rootPath: artifactsDir,
+        debounceMs: 400,
+        maxWaitMs: 1500,
+      },
+      async (event) => {
+        if (event.kind !== "changed") {
+          // rescan-required / watch-error: ask the server to refetch everything
+          await context.experimental_emitSignal("changed", {
+            sessionUuid,
+            paths: [],
+          });
+          return;
+        }
         await context.experimental_emitSignal("changed", {
           sessionUuid,
-          paths: [],
+          paths: event.changes
+            .map((change) => change.path)
+            .filter((path) => AGENT_JSONL.test(path.split("/").pop() ?? "")),
         });
-        return;
-      }
-      await context.experimental_emitSignal("changed", {
-        sessionUuid,
-        paths: event.changes
-          .map((change) => change.path)
-          .filter((path) => AGENT_JSONL.test(path.split("/").pop() ?? "")),
-      });
-    },
-  );
-  const lease = context.experimental_retainWorker();
-  watches.set(watchKey(artifactsDir), { sessionUuid, subscription, lease });
+      },
+    );
+    const lease = context.experimental_retainWorker();
+    watches.set(key, { sessionUuid, subscription, lease });
+  })();
+  pendingWatches.set(key, created);
+  try {
+    await created;
+  } finally {
+    // A failed start must be retryable by the next caller.
+    pendingWatches.delete(key);
+  }
 }

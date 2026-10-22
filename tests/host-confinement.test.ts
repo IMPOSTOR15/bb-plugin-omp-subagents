@@ -280,10 +280,13 @@ describe("activityLine", () => {
     assert.equal(activityLine({ ...base, currentToolIntent: "  " }), "grep");
     assert.equal(activityLine({ ...base, currentToolIntent: null }), "grep");
   });
-  it("shows waiting for wait/yield and for no tool yet", () => {
+  it("shows waiting, with its intent when it has one, for wait and yield", () => {
     assert.equal(activityLine({ ...base, currentTool: "wait", currentToolIntent: "" }), "waiting");
-    assert.equal(activityLine({ ...base, currentTool: "yield" }), "waiting");
-    assert.equal(activityLine({ ...base, currentTool: null }), "waiting");
+    assert.equal(activityLine({ ...base, currentTool: "yield", currentToolIntent: null }), "waiting");
+    assert.equal(activityLine({ ...base, currentTool: "wait", currentToolIntent: "Waiting for sleep to finish" }), "Waiting for sleep to finish");
+  });
+  it("calls an agent with no tool call yet starting, not waiting", () => {
+    assert.equal(activityLine({ ...base, currentTool: null, currentToolIntent: null }), "starting");
   });
   it("shows the task, not the last tool, once the agent settled", () => {
     assert.equal(activityLine({ ...base, status: "finished" }), "audit the parser");

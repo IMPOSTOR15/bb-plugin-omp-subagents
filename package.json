@@ -1,0 +1,64 @@
+{
+  "name": "bb-plugin-omp-subagents",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Watch, inspect, and steer the subagents an OMP thread spawns: live roster, transcripts, progress, and message injection in BB's own UI.",
+  "license": "MIT",
+  "author": "IMPOSTOR15",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IMPOSTOR15/bb-plugin-omp-subagents.git"
+  },
+  "homepage": "https://github.com/IMPOSTOR15/bb-plugin-omp-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/IMPOSTOR15/bb-plugin-omp-subagents/issues"
+  },
+  "keywords": [
+    "bb-plugin",
+    "omp",
+    "subagents",
+    "observability",
+    "agents"
+  ],
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.49"
+  },
+  "bb": {
+    "name": "OMP Subagents",
+    "description": "Watch OMP subagents inside BB: a live strip under each spawn, a roster panel with transcripts and results, and a CLI.",
+    "branding": {
+      "icon": "Bot"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./src/host.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "test": "node --experimental-strip-types --test tests/host-confinement.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.3.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.49",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9",
+    "sonner": "^1.7.4",
+    "tailwind-merge": "^3.4.0",
+    "typescript": "^5.7.0"
+  }
+}

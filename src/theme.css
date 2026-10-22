@@ -1,0 +1,21 @@
+/*
+ * Tone pairs for subagent status colors, following the same pattern as the
+ * bb-sidebar reference plugin: `:root, .light` and `.dark` mirror how bb's own
+ * theme stylesheet is written, keyed off the same classes, and components
+ * reference them via arbitrary-value utilities so they follow BB's live theme.
+ */
+
+:root,
+.light {
+  --bb-omp-tone-working: oklch(50% 0.134 242.749);
+  --bb-omp-tone-success: oklch(50.8% 0.118 165.612);
+  --bb-omp-tone-error: oklch(50.5% 0.213 27.518);
+  --bb-omp-tone-pending: oklch(51.1% 0.262 276.966);
+}
+
+.dark {
+  --bb-omp-tone-working: oklch(82.2% 0.111 230.318);
+  --bb-omp-tone-success: oklch(84.1% 0.143 164.978);
+  --bb-omp-tone-error: oklch(80.8% 0.114 19.571);
+  --bb-omp-tone-pending: oklch(81.1% 0.111 293.571);
+}

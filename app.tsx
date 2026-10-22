@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 import "./src/theme.css";
 import { activityLine } from "./src/activity.ts";
 import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "./src/open-agent.ts";
+import { GLYPHS } from "./src/glyphs.ts";
 import { statusStyle } from "./src/status-style.ts";
 import { startTimelineStrip } from "./src/timeline.tsx";
 import {
@@ -141,7 +142,7 @@ function AgentCountChip({
           : "text-muted-foreground hover:bg-accent hover:text-foreground",
       )}
     >
-      <Icon name="UserRoundPlus" className="size-3.5" />
+      <Icon name={GLYPHS.agentsChip} className="size-3.5" />
       {compact ? null : (
         <span className="truncate">
           {count} subagent{count === 1 ? "" : "s"}
@@ -297,7 +298,7 @@ function TranscriptView({
         if (entry.role === "toolCall") {
           return (
             <div key={index} className="flex items-start gap-2 text-xs">
-              <Icon name="Wrench" className="mt-0.5 size-3 shrink-0 text-muted-foreground" />
+              <Icon name={GLYPHS.tool} className="mt-0.5 size-3 shrink-0 text-muted-foreground" />
               <div className="min-w-0 flex-1">
                 <span className="font-medium">{entry.toolName ?? "tool"}</span>
                 {entry.intent !== null ? (
@@ -363,7 +364,7 @@ function TranscriptView({
           size="sm"
           onClick={() => setFollow((value) => !value)}
         >
-          <Icon name={follow ? "ArrowDownToLine" : "ArrowUpToLine"} className="size-3.5" />
+          <Icon name={follow ? GLYPHS.following : GLYPHS.paused} className="size-3.5" />
           {follow ? "Following" : "Paused"}
         </Button>
       </div>
@@ -446,7 +447,7 @@ function TranscriptPanel({
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Button variant="ghost" size="sm" onClick={onBack}>
-          <Icon name="ArrowLeft" className="size-3.5" />
+          <Icon name={GLYPHS.back} className="size-3.5" />
           Roster
         </Button>
         <span className="min-w-0 flex-1 truncate text-sm font-medium">{agent.id}</span>
@@ -555,7 +556,7 @@ function HubPanel({
           {agents.length} subagent{agents.length === 1 ? "" : "s"}
         </span>
         <span>· {running} running</span>
-        {loading ? <Icon name="Loading" className="size-3 animate-spin" /> : null}
+        {loading ? <Icon name={GLYPHS.spinner} className="size-3 animate-spin" /> : null}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
         {error !== null ? (
@@ -599,7 +600,7 @@ function HubPanel({
             disabled={injectText.trim() === "" || injecting}
             onClick={() => void inject()}
           >
-            <Icon name="SendHorizontal" className="size-3.5" />
+            <Icon name={GLYPHS.send} className="size-3.5" />
             Send
           </Button>
         </div>
@@ -700,7 +701,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "sessions",
     title: "OMP sessions",
-    icon: "Bot",
+    icon: GLYPHS.roster,
     path: "sessions",
     component: SessionsPage,
   });
@@ -708,7 +709,7 @@ export default definePluginApp((app) => {
   app.slots.threadPanelAction({
     id: "hub",
     title: "OMP Subagents",
-    icon: "Bot",
+    icon: GLYPHS.roster,
     layout: "flush",
     component: HubPanel,
   });

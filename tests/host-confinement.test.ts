@@ -18,6 +18,7 @@ import host from "../src/host.ts";
 import { parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
 import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
+import { GLYPHS, VERIFIED_BB_GLYPHS } from "../src/glyphs.ts";
 import { statusStyle } from "../src/status-style.ts";
 import { readHead, readLines } from "../src/bounded-read.ts";
 import { spawnedIdsFromOutput } from "../src/spawn.ts";
@@ -439,7 +440,7 @@ describe("bounded reads", () => {
 describe("statusStyle", () => {
   it("a killed agent is neutral, never bb's needs-you colour", () => {
     const killed = statusStyle("interrupted");
-    assert.equal(killed.glyph, "CircleSlash");
+    assert.equal(killed.glyph, "Square");
     assert.ok(!killed.toneClass.includes("pending"), "the pending/needs-you tone is reserved for requests");
     assert.equal(killed.spin, false);
   });
@@ -473,5 +474,15 @@ describe("opening an agent from the strip", () => {
   });
   it("uses one stable event name", () => {
     assert.equal(OPEN_AGENT_EVENT, "omp-subagents:open-agent");
+  });
+  it("only uses glyphs that exist in bb's icon set (an unknown name renders as a lightning bolt)", () => {
+    for (const status of ["running", "finished", "failed", "interrupted", "partial"] as const) {
+      assert.ok((VERIFIED_BB_GLYPHS as readonly string[]).includes(statusStyle(status).glyph), `${status} uses an unverified glyph`);
+    }
+  });
+  it("every glyph the plugin draws is verified (the unknown ones render as a lightning bolt)", () => {
+    for (const [use, name] of Object.entries(GLYPHS)) {
+      assert.ok((VERIFIED_BB_GLYPHS as readonly string[]).includes(name), `${use} uses unverified glyph ${name}`);
+    }
   });
 });

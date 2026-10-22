@@ -1,8 +1,9 @@
 // One place for how an agent status looks, so the roster and the timeline strip
 // never disagree. Plain strings only (no React), so it is unit-testable.
 import type { AgentStatus } from "./contract.ts";
+import { GLYPHS } from "./glyphs.ts";
 
-export type StatusGlyph = "Loading" | "CircleCheck" | "CircleX" | "CircleSlash" | "CircleDashed";
+export type StatusGlyph = (typeof GLYPHS)["running" | "finished" | "failed" | "interrupted" | "stopped"];
 
 export interface StatusStyle {
   /** bb icon name. */
@@ -23,20 +24,20 @@ const TONE = {
 
 /**
  * A killed agent (`interrupted`) did not ask for anything, so it must not wear
- * bb's "needs you" colour; it is grey with a slashed circle. An orphaned agent
- * (`partial`) is dashed and grey for the same reason.
+ * bb's "needs you" colour; it is a grey stop square. An orphaned agent
+ * (`partial`) is an empty grey circle for the same reason.
  */
 export function statusStyle(status: AgentStatus): StatusStyle {
   switch (status) {
     case "running":
-      return { glyph: "Loading", toneClass: TONE.working, label: "Running", spin: true };
+      return { glyph: GLYPHS.running, toneClass: TONE.working, label: "Running", spin: true };
     case "finished":
-      return { glyph: "CircleCheck", toneClass: TONE.success, label: "Finished", spin: false };
+      return { glyph: GLYPHS.finished, toneClass: TONE.success, label: "Finished", spin: false };
     case "failed":
-      return { glyph: "CircleX", toneClass: TONE.error, label: "Failed", spin: false };
+      return { glyph: GLYPHS.failed, toneClass: TONE.error, label: "Failed", spin: false };
     case "interrupted":
-      return { glyph: "CircleSlash", toneClass: TONE.muted, label: "Interrupted", spin: false };
+      return { glyph: GLYPHS.interrupted, toneClass: TONE.muted, label: "Interrupted", spin: false };
     case "partial":
-      return { glyph: "CircleDashed", toneClass: TONE.muted, label: "Stopped without a result", spin: false };
+      return { glyph: GLYPHS.stopped, toneClass: TONE.muted, label: "Stopped without a result", spin: false };
   }
 }

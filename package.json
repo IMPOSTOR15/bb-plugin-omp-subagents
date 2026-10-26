@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-omp-subagents",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Watch, inspect, and steer the subagents an OMP thread spawns: live roster, transcripts, progress, and message injection in BB's own UI.",
   "license": "MIT",

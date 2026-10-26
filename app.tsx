@@ -174,11 +174,9 @@ function AgentCountChip({
 
 function HeaderChip({
   threadId,
-  projectId,
   isCompactViewport,
 }: {
   threadId: string;
-  projectId: string;
   isCompactViewport: boolean;
 }) {
   const { roster } = useRoster(threadId);
@@ -191,7 +189,7 @@ function HeaderChip({
   // mounted (the toast navigated to the thread first) is parked and taken now.
   useEffect(() => {
     const open = (agentId: string) =>
-      openHubPanel((options) => navigate.openThreadPanel(options), { threadId, projectId, agentId });
+      openHubPanel((options) => navigate.openThreadPanel(options), { threadId, agentId });
     const parked = takePendingOpen(threadId);
     if (parked !== null) open(parked.agentId);
     const onOpen = (event: Event) => {
@@ -204,7 +202,7 @@ function HeaderChip({
     };
     window.addEventListener(OPEN_AGENT_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_AGENT_EVENT, onOpen);
-  }, [navigate, threadId, projectId]);
+  }, [navigate, threadId]);
 
   if (agents.length === 0) return null;
   return (
@@ -212,7 +210,7 @@ function HeaderChip({
       count={agents.length}
       running={running}
       compact={isCompactViewport}
-      onClick={() => openHubPanel((options) => navigate.openThreadPanel(options), { threadId, projectId })}
+      onClick={() => openHubPanel((options) => navigate.openThreadPanel(options), { threadId })}
     />
   );
 }
@@ -670,8 +668,12 @@ function HubPanel({
   const { roster, error, loading } = useRoster(targetThreadId);
   const [selectedId, setSelectedId] = useState<string | null>(hubParams.agentId);
   const [requestedFilter, setFilter] = useState<AgentStatus | "all">("all");
-  // bb focuses this tab again when the same target is opened, and the tab
-  // keeps its state: show the target again (the agent after going back).
+  // bb hands one mounted panel the params of whichever hub tab is shown.
+  useEffect(() => {
+    setSelectedId(hubParams.agentId);
+  }, [targetThreadId, hubParams.agentId]);
+  // Opening the target this tab already shows only focuses it, with no new
+  // params: show the target again (the agent after going back to the roster).
   useEffect(
     () =>
       onHubOpen((opened) => {
@@ -936,10 +938,7 @@ export default definePluginApp((app) => {
             label: "Open OMP subagents",
             icon: GLYPHS.roster,
             run: () => {
-              openHubPanel((options) => navigate.openThreadPanel(options), {
-                threadId: thread.id,
-                projectId: thread.projectId,
-              });
+              openHubPanel((options) => navigate.openThreadPanel(options), { threadId: thread.id });
             },
           }
         : null,
@@ -952,9 +951,9 @@ export default definePluginApp((app) => {
     title: "Open OMP subagents",
     isAvailable: ({ threadId }) =>
       threadId !== null && rosterStore.sessionUuidOf(threadId) !== null,
-    run: ({ threadId, projectId, openPanel }) => {
+    run: ({ threadId, openPanel }) => {
       if (threadId === null) return;
-      openHubPanel(openPanel, { threadId, projectId });
+      openHubPanel(openPanel, { threadId });
     },
   });
 
@@ -964,13 +963,13 @@ export default definePluginApp((app) => {
     isAvailable: ({ threadId }) =>
       threadId !== null &&
       nextRunningAgent(rosterStore.getView(threadId).roster?.agents ?? [], null) !== null,
-    run: ({ threadId, projectId, openPanel }) => {
+    run: ({ threadId, openPanel }) => {
       if (threadId === null) return;
       const agents = rosterStore.getView(threadId).roster?.agents ?? [];
       const next = nextRunningAgent(agents, lastOpenedRunning.get(threadId) ?? null);
       if (next === null) return;
       lastOpenedRunning.set(threadId, next.id);
-      openHubPanel(openPanel, { threadId, projectId, agentId: next.id });
+      openHubPanel(openPanel, { threadId, agentId: next.id });
     },
   });
 

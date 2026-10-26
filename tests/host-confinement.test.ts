@@ -17,7 +17,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 import host, { isAgentArtifact, isSessionDirUnder, sessionUuidFromDir } from "../src/host.ts";
 import { clipBody, parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
-import { onHubOpen, openHubPanel, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
+import { onHubOpen, openHubPanel, parseHubParams, parseOpenAgentRequest, type HubOpenOptions } from "../src/open-agent.ts";
 import { GLYPHS, VERIFIED_BB_GLYPHS } from "../src/glyphs.ts";
 import { statusStyle } from "../src/status-style.ts";
 import { readHead, readLines } from "../src/bounded-read.ts";
@@ -584,15 +584,16 @@ describe("opening an agent from the strip", () => {
     assert.deepEqual(parseHubParams({ threadId: 7, agentId: "" }), { threadId: null, agentId: null });
   });
   it("opening the same target twice sends identical params, so bb focuses one tab, and re-points it", () => {
-    const sent: unknown[] = [];
-    const open = (options: unknown) => (sent.push(options), true);
+    const sent: HubOpenOptions[] = [];
+    const open = (options: HubOpenOptions) => (sent.push(options), true);
     const seen: unknown[] = [];
     const stop = onHubOpen((opened) => seen.push(opened));
-    const agent = { threadId: "thr_1", projectId: "p", agentId: "Scout-2" };
+    const agent = { threadId: "thr_1", agentId: "Scout-2" };
     openHubPanel(open, agent);
     openHubPanel(open, agent);
-    openHubPanel(open, { threadId: "thr_1", projectId: "p" });
+    openHubPanel(open, { threadId: "thr_1" });
     assert.deepEqual(sent[1], sent[0]);
+    assert.deepEqual(sent[0]!.params, agent, "only the target decides which tab is reused");
     assert.notDeepEqual(sent[2], sent[0], "the roster and an agent are separate tabs");
     assert.deepEqual(seen, [
       { threadId: "thr_1", agentId: "Scout-2" },

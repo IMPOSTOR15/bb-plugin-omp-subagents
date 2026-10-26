@@ -42,16 +42,16 @@ export function parseHubParams(params: unknown): HubParams {
   return { threadId: text("threadId"), agentId: text("agentId") };
 }
 
-export interface HubTarget {
+/** What a hub tab shows; bb reuses an open tab whose params are identical. */
+export type HubTarget = {
   threadId: string;
-  projectId: string | null;
   agentId?: string;
-}
+};
 
 export interface HubOpenOptions {
   actionId: "hub";
   title: string;
-  params: { threadId: string; projectId: string | null; agentId?: string };
+  params: HubTarget;
 }
 
 type HubOpened = { threadId: string; agentId: string | null };
@@ -67,8 +67,8 @@ const hubOpenListeners = new Set<(opened: HubOpened) => void>();
 export function openHubPanel(open: (options: HubOpenOptions) => boolean, target: HubTarget): boolean {
   const params =
     target.agentId === undefined
-      ? { threadId: target.threadId, projectId: target.projectId }
-      : { threadId: target.threadId, projectId: target.projectId, agentId: target.agentId };
+      ? { threadId: target.threadId }
+      : { threadId: target.threadId, agentId: target.agentId };
   const accepted = open({ actionId: "hub", title: target.agentId ?? "OMP Subagents", params });
   if (accepted) {
     const opened = { threadId: target.threadId, agentId: target.agentId ?? null };

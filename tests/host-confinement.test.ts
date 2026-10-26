@@ -17,7 +17,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 import host, { isAgentArtifact, isSessionDirUnder, sessionUuidFromDir } from "../src/host.ts";
 import { clipBody, parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
-import { hubPanelParams, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
+import { onHubOpen, openHubPanel, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
 import { GLYPHS, VERIFIED_BB_GLYPHS } from "../src/glyphs.ts";
 import { statusStyle } from "../src/status-style.ts";
 import { readHead, readLines } from "../src/bounded-read.ts";
@@ -578,16 +578,32 @@ describe("opening an agent from the strip", () => {
     }
   });
   it("panel params carry the thread and the agent to open", () => {
-    assert.deepEqual(parseHubParams({ threadId: "thr_1", agentId: "Scout-2", projectId: "p", openSeq: 3 }), { threadId: "thr_1", agentId: "Scout-2", openSeq: 3 });
-    assert.deepEqual(parseHubParams({ threadId: "thr_1" }), { threadId: "thr_1", agentId: null, openSeq: null });
-    assert.deepEqual(parseHubParams(null), { threadId: null, agentId: null, openSeq: null });
-    assert.deepEqual(parseHubParams({ threadId: 7, agentId: "", openSeq: "1" }), { threadId: null, agentId: null, openSeq: null });
+    assert.deepEqual(parseHubParams({ threadId: "thr_1", agentId: "Scout-2", projectId: "p" }), { threadId: "thr_1", agentId: "Scout-2" });
+    assert.deepEqual(parseHubParams({ threadId: "thr_1" }), { threadId: "thr_1", agentId: null });
+    assert.deepEqual(parseHubParams(null), { threadId: null, agentId: null });
+    assert.deepEqual(parseHubParams({ threadId: 7, agentId: "" }), { threadId: null, agentId: null });
   });
-  it("opening the same agent twice yields params that differ, so the panel re-points", () => {
-    const first = parseHubParams(hubPanelParams({ threadId: "thr_1", projectId: "p", agentId: "Scout-2" }));
-    const again = parseHubParams(hubPanelParams({ threadId: "thr_1", projectId: "p", agentId: "Scout-2" }));
-    assert.equal(again.agentId, first.agentId);
-    assert.notEqual(again.openSeq, first.openSeq);
+  it("opening the same target twice sends identical params, so bb focuses one tab, and re-points it", () => {
+    const sent: unknown[] = [];
+    const open = (options: unknown) => (sent.push(options), true);
+    const seen: unknown[] = [];
+    const stop = onHubOpen((opened) => seen.push(opened));
+    const agent = { threadId: "thr_1", projectId: "p", agentId: "Scout-2" };
+    openHubPanel(open, agent);
+    openHubPanel(open, agent);
+    openHubPanel(open, { threadId: "thr_1", projectId: "p" });
+    assert.deepEqual(sent[1], sent[0]);
+    assert.notDeepEqual(sent[2], sent[0], "the roster and an agent are separate tabs");
+    assert.deepEqual(seen, [
+      { threadId: "thr_1", agentId: "Scout-2" },
+      { threadId: "thr_1", agentId: "Scout-2" },
+      { threadId: "thr_1", agentId: null },
+    ]);
+    openHubPanel(() => false, agent);
+    assert.equal(seen.length, 3, "a declined open re-points nothing");
+    stop();
+    openHubPanel(open, agent);
+    assert.equal(seen.length, 3);
   });
   it("only uses glyphs that exist in bb's icon set (an unknown name renders as a lightning bolt)", () => {
     for (const status of ["running", "finished", "failed", "interrupted", "partial"] as const) {

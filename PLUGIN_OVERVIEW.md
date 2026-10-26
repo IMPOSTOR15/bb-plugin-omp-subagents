@@ -34,3 +34,5 @@ interrupted, or partial for an agent that stopped without a clean end.
   subagent. The plugin does not kill or revive agents.
 - The strip reads BB's internal timeline code, which is not a public API. A BB
   update can remove the strip; the timeline itself is not affected.
+- Sidebar status and the row menu item show in BB's own thread list, not in
+  thread list plugins that draw their own rows.

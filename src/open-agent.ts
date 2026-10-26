@@ -23,43 +23,66 @@ export function parseOpenAgentRequest(detail: unknown): OpenAgentRequest | null 
 
 /**
  * Panel params: a thread to show and, optionally, an agent to open straight
- * away. `openSeq` differs on every explicit open, so opening the same target
- * again (the same agent after going back to the roster) still re-points a
- * panel whose other params did not change.
+ * away. They name the target and nothing else: bb focuses an open tab whose
+ * params are identical instead of adding another one.
  */
 export interface HubParams {
   threadId: string | null;
   agentId: string | null;
-  openSeq: number | null;
 }
 
 export function parseHubParams(params: unknown): HubParams {
-  const field = (key: string): unknown =>
-    params === null || typeof params !== "object" || !(key in params)
-      ? undefined
-      : (params as Record<string, unknown>)[key];
   const text = (key: string): string | null => {
-    const value = field(key);
+    const value =
+      params === null || typeof params !== "object" || !(key in params)
+        ? undefined
+        : (params as Record<string, unknown>)[key];
     return typeof value === "string" && value !== "" ? value : null;
   };
-  const seq = field("openSeq");
-  return {
-    threadId: text("threadId"),
-    agentId: text("agentId"),
-    openSeq: typeof seq === "number" && Number.isFinite(seq) ? seq : null,
-  };
+  return { threadId: text("threadId"), agentId: text("agentId") };
 }
 
-let lastOpenSeq = 0;
-
-/** Params for one explicit open of the hub panel, stamped with a fresh `openSeq`. */
-export function hubPanelParams(target: {
+export interface HubTarget {
   threadId: string;
   projectId: string | null;
   agentId?: string;
-}): { threadId: string; projectId: string | null; agentId?: string; openSeq: number } {
-  lastOpenSeq += 1;
-  return { ...target, openSeq: lastOpenSeq };
+}
+
+export interface HubOpenOptions {
+  actionId: "hub";
+  title: string;
+  params: { threadId: string; projectId: string | null; agentId?: string };
+}
+
+type HubOpened = { threadId: string; agentId: string | null };
+
+const hubOpenListeners = new Set<(opened: HubOpened) => void>();
+
+/**
+ * Open the hub panel at `target` through `open`, any of bb's openPanel entry
+ * points. A focused tab keeps its own state, so after an accepted open the
+ * panel showing this target is told to show it again: the same agent after
+ * the user went back to the roster in that tab.
+ */
+export function openHubPanel(open: (options: HubOpenOptions) => boolean, target: HubTarget): boolean {
+  const params =
+    target.agentId === undefined
+      ? { threadId: target.threadId, projectId: target.projectId }
+      : { threadId: target.threadId, projectId: target.projectId, agentId: target.agentId };
+  const accepted = open({ actionId: "hub", title: target.agentId ?? "OMP Subagents", params });
+  if (accepted) {
+    const opened = { threadId: target.threadId, agentId: target.agentId ?? null };
+    for (const listener of hubOpenListeners) listener(opened);
+  }
+  return accepted;
+}
+
+/** Subscribe a mounted hub panel to accepted opens; returns the unsubscribe. */
+export function onHubOpen(listener: (opened: HubOpened) => void): () => void {
+  hubOpenListeners.add(listener);
+  return () => {
+    hubOpenListeners.delete(listener);
+  };
 }
 
 /** A parked request is dropped after this long: it was not meant for later. */

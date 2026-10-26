@@ -12,8 +12,9 @@ import type { ReactNode } from "react";
 import "./src/theme.css";
 import { activityLine } from "./src/activity.ts";
 import {
-  hubPanelParams,
   OPEN_AGENT_EVENT,
+  onHubOpen,
+  openHubPanel,
   parseHubParams,
   parseOpenAgentRequest,
   requestOpenAgent,
@@ -190,11 +191,7 @@ function HeaderChip({
   // mounted (the toast navigated to the thread first) is parked and taken now.
   useEffect(() => {
     const open = (agentId: string) =>
-      navigate.openThreadPanel({
-        actionId: "hub",
-        title: agentId,
-        params: hubPanelParams({ threadId, projectId, agentId }),
-      });
+      openHubPanel((options) => navigate.openThreadPanel(options), { threadId, projectId, agentId });
     const parked = takePendingOpen(threadId);
     if (parked !== null) open(parked.agentId);
     const onOpen = (event: Event) => {
@@ -215,13 +212,7 @@ function HeaderChip({
       count={agents.length}
       running={running}
       compact={isCompactViewport}
-      onClick={() =>
-        navigate.openThreadPanel({
-          actionId: "hub",
-          title: "OMP Subagents",
-          params: hubPanelParams({ threadId, projectId }),
-        })
-      }
+      onClick={() => openHubPanel((options) => navigate.openThreadPanel(options), { threadId, projectId })}
     />
   );
 }
@@ -679,11 +670,17 @@ function HubPanel({
   const { roster, error, loading } = useRoster(targetThreadId);
   const [selectedId, setSelectedId] = useState<string | null>(hubParams.agentId);
   const [requestedFilter, setFilter] = useState<AgentStatus | "all">("all");
-  // The same tab can be re-pointed by new params; openSeq makes every explicit
-  // open count, including the same agent again after going back to the roster.
-  useEffect(() => {
-    setSelectedId(hubParams.agentId);
-  }, [hubParams.agentId, hubParams.openSeq]);
+  // bb focuses this tab again when the same target is opened, and the tab
+  // keeps its state: show the target again (the agent after going back).
+  useEffect(
+    () =>
+      onHubOpen((opened) => {
+        if (opened.threadId === targetThreadId && opened.agentId === hubParams.agentId) {
+          setSelectedId(opened.agentId);
+        }
+      }),
+    [targetThreadId, hubParams.agentId],
+  );
 
   const selected = useMemo(
     () => roster?.agents.find((agent) => agent.id === selectedId) ?? null,
@@ -939,10 +936,9 @@ export default definePluginApp((app) => {
             label: "Open OMP subagents",
             icon: GLYPHS.roster,
             run: () => {
-              navigate.openThreadPanel({
-                actionId: "hub",
-                title: "OMP Subagents",
-                params: hubPanelParams({ threadId: thread.id, projectId: thread.projectId }),
+              openHubPanel((options) => navigate.openThreadPanel(options), {
+                threadId: thread.id,
+                projectId: thread.projectId,
               });
             },
           }
@@ -958,11 +954,7 @@ export default definePluginApp((app) => {
       threadId !== null && rosterStore.sessionUuidOf(threadId) !== null,
     run: ({ threadId, projectId, openPanel }) => {
       if (threadId === null) return;
-      openPanel({
-        actionId: "hub",
-        title: "OMP Subagents",
-        params: hubPanelParams({ threadId, projectId }),
-      });
+      openHubPanel(openPanel, { threadId, projectId });
     },
   });
 
@@ -978,11 +970,7 @@ export default definePluginApp((app) => {
       const next = nextRunningAgent(agents, lastOpenedRunning.get(threadId) ?? null);
       if (next === null) return;
       lastOpenedRunning.set(threadId, next.id);
-      openPanel({
-        actionId: "hub",
-        title: next.id,
-        params: hubPanelParams({ threadId, projectId, agentId: next.id }),
-      });
+      openHubPanel(openPanel, { threadId, projectId, agentId: next.id });
     },
   });
 

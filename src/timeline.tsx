@@ -5,13 +5,15 @@
 // them. This content script injects a live subagent strip below every such
 // row in the timeline, in bb's own row vocabulary.
 //
-// The strip is driven by the same agents_list RPC the Hub panel uses, and
-// disappears automatically when no listed agent is running.
+// The strip reads the shared roster store (src/roster-store.ts) that also feeds
+// the Hub panel; it owns no timer or request of its own.
 import { createRoot, type Root } from "react-dom/client";
-import { createElement, useEffect, useRef, useState } from "react";
+import { createElement, useMemo } from "react";
 import type { AgentSummary } from "./contract.ts";
 import { activityLine } from "./activity.ts";
-import { OPEN_AGENT_EVENT } from "./open-agent.ts";
+import { requestOpenAgent } from "./open-agent.ts";
+import { agentsForRow } from "./roster-derive.ts";
+import { useRoster } from "./use-roster.ts";
 import { statusStyle } from "./status-style.ts";
 import { spawnedIdsFromOutput } from "./spawn.ts";
 import { Icon } from "@/components/ui/icon";
@@ -113,11 +115,7 @@ function AgentStripLine({ agent, threadId }: { agent: AgentSummary; threadId: st
   return (
     <button
       type="button"
-      onClick={() =>
-        window.dispatchEvent(
-          new CustomEvent(OPEN_AGENT_EVENT, { detail: { threadId, agentId: agent.id } }),
-        )
-      }
+      onClick={() => requestOpenAgent({ threadId, agentId: agent.id })}
       title={`${style.label}: open ${agent.id} history`}
       aria-label={`Open ${agent.id} history (${style.label})`}
       className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm px-1 py-px text-left hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:outline-none"
@@ -142,60 +140,14 @@ function AgentStripLine({ agent, threadId }: { agent: AgentSummary; threadId: st
   );
 }
 
-type AgentsEnvelope = { ok: boolean; result?: { agents: AgentSummary[] } };
-
-/** One mounted strip: polls its thread's roster until no agent runs. */
+/** One mounted strip: shows its row's agents from the shared roster store. */
 function TaskStrip({ row }: { row: TaskRow }) {
-  const [agents, setAgents] = useState<AgentSummary[] | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const names = new Set(row.agentNames);
-    const load = () => {
-      fetch("/api/v1/plugins/omp-subagents/rpc/agents_list", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ threadId: row.threadId }),
-      })
-        .then((response) => response.json() as Promise<AgentsEnvelope>)
-        .then((envelope) => {
-          observe(envelope);
-          if (cancelled || !envelope.ok || envelope.result === undefined) return;
-          // Keep spawn order: the roster is sorted by activity, which would
-          // make the lines swap places on every poll.
-          const rank = new Map(row.agentNames.map((name, index) => [name, index]));
-          setAgents(
-            envelope.result.agents
-              .filter((agent) => names.has(agent.id))
-              .sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0)),
-          );
-        })
-        .catch(() => undefined);
-    };
-    let timer: ReturnType<typeof setInterval> | undefined;
-    const schedule = (ms: number) => {
-      if (timer !== undefined) clearInterval(timer);
-      timer = setInterval(load, ms);
-    };
-    load();
-    let anyRunning = true;
-    const observe = (envelope: AgentsEnvelope) => {
-      if (envelope.ok && envelope.result !== undefined) {
-        const next = envelope.result.agents.some((agent) => agent.status === "running");
-        if (next !== anyRunning) {
-          anyRunning = next;
-          schedule(next ? 4000 : 15000);
-        }
-      }
-    };
-    // fast while running, slow once settled (status flips still show)
-    schedule(4000);
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) clearInterval(timer);
-    };
-  }, [row.threadId, row.agentNames]);
-  if (agents === null) return null;
+  const { roster } = useRoster(row.threadId);
+  const agents = useMemo(
+    () => (roster === null ? [] : agentsForRow(roster.agents, row.agentNames)),
+    [roster, row.agentNames],
+  );
+  if (agents.length === 0) return null;
   return (
     <div
       role="status"

@@ -154,9 +154,15 @@ export const hostContract = defineRpcContract({
       truncated: z.boolean(),
     }),
   },
-  watch: {
-    input: z.object({ path: z.string().min(1) }),
-    output: z.object({ watched: z.boolean() }),
+  agent_patch: {
+    input: z.object({
+      artifactsDir: z.string().min(1),
+      agentId: agentIdSchema,
+    }),
+    output: z.object({
+      content: z.string(),
+      truncated: z.boolean(),
+    }),
   },
 });
 
@@ -164,17 +170,16 @@ export type HostSessionsListResult = z.infer<
   (typeof hostContract)["sessions_list"]["output"]
 >;
 
-// Host → server signals. `changed` fires when files under a watched session
-// artifacts dir change (live subagent progress); `sessionsChanged` fires for
-// anything under the sessions root (new sessions, new agents).
+// Host → server signals. `changed` fires when an agent's own files (transcript,
+// final output, patch) change under a watched session artifacts dir (live
+// subagent progress). `sessionUuid` is the bare OMP session uuid, the part of
+// the artifacts-dir name after the last `_`. An empty `paths` means "refetch
+// everything" (the watcher lost track of changes).
 export const hostSignals = {
   changed: {
     payload: z.object({
       sessionUuid: z.string(),
       paths: z.array(z.string()),
     }),
-  },
-  sessionsChanged: {
-    payload: z.object({ paths: z.array(z.string()) }),
   },
 } as const;

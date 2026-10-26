@@ -12,12 +12,14 @@ import {
 } from "@get-bb/plugin-sdk/host";
 import {
   clipOutput,
-  parseAgentFile,
+  finalizeAgent,
+  parseAgentRows,
   parseLatestTaskAgents,
   parseTranscript,
 } from "./omp.ts";
+import type { ParsedAgent } from "./omp.ts";
 import { hostContract, hostSignals } from "./contract.ts";
-import { readHead, readLines, regularFileSize } from "./bounded-read.ts";
+import { readHead, readLines, regularFileSize, regularFileStat } from "./bounded-read.ts";
 import type { AgentSummary } from "./contract.ts";
 
 // Matches the contract's sessions_list `limit` ceiling.
@@ -131,8 +133,19 @@ async function listSessions(): Promise<SessionEntry[]> {
 
 const AGENT_JSONL = /^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/;
 
-async function listAgentFiles(artifactsDir: string): Promise<Array<{ file: string; id: string; mtimeMs: number }>> {
-  const out: Array<{ file: string; id: string; mtimeMs: number }> = [];
+/** Every file an agent leaves: transcript, final output, isolated-run patch. */
+const AGENT_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(jsonl|md|json|patch)$/;
+
+/** A changed path matters to rosters only when it is an agent's own file. */
+function isAgentArtifact(path: string): boolean {
+  const name = path.split("/").pop() ?? "";
+  return name !== "__advisor.jsonl" && AGENT_ARTIFACT.test(name);
+}
+
+type AgentFileInfo = { file: string; id: string; mtimeMs: number; size: number };
+
+async function listAgentFiles(artifactsDir: string): Promise<AgentFileInfo[]> {
+  const out: AgentFileInfo[] = [];
   // The session dir plus EVERY subdirectory: each parent agent that spawned
   // children has its own folder (<Parent>/<Parent>.<Child>.jsonl).
   for (const dir of await agentDirs(artifactsDir)) {
@@ -152,6 +165,7 @@ async function listAgentFiles(artifactsDir: string): Promise<Array<{ file: strin
           file,
           id: entry.name.slice(0, -".jsonl".length),
           mtimeMs: st.mtimeMs,
+          size: st.size,
         });
       } catch {
         // raced away; skip
@@ -161,23 +175,78 @@ async function listAgentFiles(artifactsDir: string): Promise<Array<{ file: strin
   return out;
 }
 
+// ---- Parse caches -------------------------------------------------------------
+//
+// A roster is refetched often while agents run, but most transcripts (and the
+// parent session file) have not changed between two calls. The now-independent
+// parse is cached per file version (mtime + size); the clock- and
+// artifact-dependent fields are recomputed on every call (`finalizeAgent`).
+// Both caches are LRU-bounded, pruned to what a session still lists, and
+// dropped with the session's watch.
+
+const MAX_CACHED_TRANSCRIPTS = 1000;
+const MAX_CACHED_PARENT_BATCHES = 64;
+
+type FileVersion = { mtimeMs: number; size: number };
+
+const transcriptCache = new Map<string, FileVersion & { parsed: ParsedAgent }>();
+const parentBatchCache = new Map<string, FileVersion & { batch: Set<string> }>();
+
+/** Re-insert as newest, then evict the oldest entries beyond `max`. */
+function remember<V>(cache: Map<string, V>, key: string, value: V, max: number): void {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > max) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
+
+/** Forget cached parses under `confined` that `keep` does not list. */
+function pruneSessionCache(confined: string, keep: ReadonlySet<string>): void {
+  const prefix = `${confined}/`;
+  for (const file of transcriptCache.keys()) {
+    if (file.startsWith(prefix) && !keep.has(file)) transcriptCache.delete(file);
+  }
+}
+
+function dropSessionCache(confined: string): void {
+  pruneSessionCache(confined, new Set());
+  parentBatchCache.delete(`${confined}.jsonl`);
+}
+
 async function readAgent(
-  info: { file: string; id: string; mtimeMs: number },
+  info: AgentFileInfo,
+  now: number,
 ): Promise<AgentSummary | null> {
   try {
-    const lines = await readLines(info.file, 1_500_000);
+    let parsed: ParsedAgent;
+    const cached = transcriptCache.get(info.file);
+    if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+      parsed = cached.parsed;
+      remember(transcriptCache, info.file, cached, MAX_CACHED_TRANSCRIPTS);
+    } else {
+      // Keyed by the version stat'ed BEFORE the read: a file that grows
+      // meanwhile only costs one extra parse next call, never a stale hit.
+      parsed = parseAgentRows(info.id, await readLines(info.file, 1_500_000));
+      remember(
+        transcriptCache,
+        info.file,
+        { mtimeMs: info.mtimeMs, size: info.size, parsed },
+        MAX_CACHED_TRANSCRIPTS,
+      );
+    }
     const base = info.file.slice(0, -".jsonl".length);
+    // Artifacts appear without the transcript changing: checked on every call.
     const [hasMd, hasJson, hasPatch] = await Promise.all([
       pathExists(`${base}.md`),
       pathExists(`${base}.json`),
       pathExists(`${base}.patch`),
     ]);
-    return parseAgentFile(info.id, lines, info.mtimeMs, Date.now(), {
-      hasMd,
-      hasJson,
-      hasPatch,
-    });
+    return finalizeAgent(parsed, info.mtimeMs, now, { hasMd, hasJson, hasPatch });
   } catch {
+    transcriptCache.delete(info.file);
     return null;
   }
 }
@@ -234,26 +303,95 @@ async function readParentTaskBatch(
   sessionFile: string,
 ): Promise<Set<string>> {
   try {
-    const lines = await readLines(sessionFile, 4_000_000);
-    return parseLatestTaskAgents(lines);
+    const version = await regularFileStat(sessionFile);
+    if (version === null) throw new Error("not a regular file");
+    const cached = parentBatchCache.get(sessionFile);
+    if (cached !== undefined && cached.mtimeMs === version.mtimeMs && cached.size === version.size) {
+      remember(parentBatchCache, sessionFile, cached, MAX_CACHED_PARENT_BATCHES);
+      return cached.batch;
+    }
+    const batch = parseLatestTaskAgents(await readLines(sessionFile, 4_000_000));
+    remember(
+      parentBatchCache,
+      sessionFile,
+      { mtimeMs: version.mtimeMs, size: version.size, batch },
+      MAX_CACHED_PARENT_BATCHES,
+    );
+    return batch;
   } catch {
+    parentBatchCache.delete(sessionFile);
     return new Set();
   }
 }
 
-// One watch per session dir: sessionUuid -> subscription. Leases keep the
-// worker alive while anything is watched.
+// One watch per session dir. Leases keep the worker alive while anything is
+// watched; a watch nobody has read for WATCH_IDLE_MS is released by the sweep.
 type WatchState = {
   sessionUuid: string;
   subscription: { dispose(): Promise<void> };
   lease: { dispose(): Promise<void> };
+  lastUsedAtMs: number;
 };
 
 const watches = new Map<string, WatchState>();
 
+/**
+ * Bumped by dispose(). A watch start that began under an older generation (an
+ * agents_list still in flight when the entry was disposed) releases its own
+ * subscription instead of registering it, so nothing outlives the entry.
+ */
+let generation = 0;
+
+/** A roster nobody has asked for in this long is not being looked at. */
+const WATCH_IDLE_MS = 5 * 60_000;
+const WATCH_SWEEP_INTERVAL_MS = 60_000;
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopSweepTimer(): void {
+  if (sweepTimer === null) return;
+  clearInterval(sweepTimer);
+  sweepTimer = null;
+}
+
+function ensureSweepTimer(): void {
+  if (sweepTimer !== null) return;
+  sweepTimer = setInterval(() => {
+    void sweepIdleWatches(Date.now());
+  }, WATCH_SWEEP_INTERVAL_MS);
+  sweepTimer.unref();
+}
+
+async function releaseWatch(state: WatchState): Promise<void> {
+  // Both must run even if the first fails, or the lease would pin the worker.
+  await Promise.allSettled([state.subscription.dispose(), state.lease.dispose()]);
+}
+
+/** Release every watch not used for more than WATCH_IDLE_MS before `now`. */
+export async function sweepIdleWatches(now: number): Promise<void> {
+  const idle: Array<[string, WatchState]> = [];
+  for (const entry of watches) {
+    if (now - entry[1].lastUsedAtMs > WATCH_IDLE_MS) idle.push(entry);
+  }
+  // Leave the map first: a call arriving mid-release starts a fresh watch.
+  for (const [key] of idle) {
+    watches.delete(key);
+    dropSessionCache(key);
+  }
+  if (watches.size === 0) stopSweepTimer();
+  await Promise.all(idle.map(([, state]) => releaseWatch(state)));
+}
+
+/** Mark a session's watch as in use; a no-op when it is not watched. */
+function touchWatch(confined: string): void {
+  const state = watches.get(watchKey(confined));
+  if (state !== undefined) state.lastUsedAtMs = Date.now();
+}
+
+/** The OMP session uuid: the part of `<timestamp>_<uuid>` after the last `_`. */
 function sessionUuidFromDir(artifactsDir: string): string {
-  const parts = artifactsDir.split("/");
-  return parts[parts.length - 1] ?? artifactsDir;
+  const name = artifactsDir.split("/").pop() ?? artifactsDir;
+  return name.slice(name.lastIndexOf("_") + 1);
 }
 
 /** Watch identity is the full confined path: two workspaces may share a dir name. */
@@ -321,13 +459,25 @@ export default experimental_defineHostEntry({
     },
 
     async agents_list({ artifactsDir }, context) {
+      const startedIn = generation;
       const confined = await confinedArtifactsDir(artifactsDir);
+      // Watch before reading: a change landing between the read and the watch
+      // start would otherwise go unsignalled. Best-effort: a watcher failure
+      // must not hide the roster.
+      if (watches.has(watchKey(confined))) touchWatch(confined);
+      else {
+        await startWatch(context, sessionUuidFromDir(confined), confined, startedIn).catch(
+          () => undefined,
+        );
+      }
+      const now = Date.now();
       const sessionFile = `${confined}.jsonl`;
       const [agentFiles, latestBatch] = await Promise.all([
         listAgentFiles(confined),
         readParentTaskBatch(sessionFile),
       ]);
-      const agents = (await mapPool(agentFiles, 8, readAgent)).flatMap((agent) =>
+      pruneSessionCache(confined, new Set(agentFiles.map((info) => info.file)));
+      const agents = (await mapPool(agentFiles, 8, (info) => readAgent(info, now))).flatMap((agent) =>
         agent === null ? [] : [agent],
       );
       // lineage: "Parent.Child" ids nest under "Parent"
@@ -345,11 +495,6 @@ export default experimental_defineHostEntry({
         agent.spawnedInLatestBatch =
           latestBatch.size > 0 && latestBatch.has(agent.id);
       }
-      // keep the worker alive while a roster is being watched
-      // Watching is best-effort: a watcher failure must not hide the roster.
-      if (!watches.has(watchKey(confined))) {
-        await startWatch(context, sessionUuidFromDir(confined), confined).catch(() => undefined);
-      }
       agents.sort(
         (a, b) => (b.lastActivityAtMs ?? 0) - (a.lastActivityAtMs ?? 0),
       );
@@ -358,6 +503,7 @@ export default experimental_defineHostEntry({
 
     async agent_transcript({ artifactsDir, agentId }) {
       const confined = await confinedArtifactsDir(artifactsDir);
+      touchWatch(confined);
       const id = safeAgentId(agentId);
       for (const dir of await agentDirs(confined)) {
         const file = join(dir, `${id}.jsonl`);
@@ -370,6 +516,7 @@ export default experimental_defineHostEntry({
 
     async agent_output({ artifactsDir, agentId }) {
       const confined = await confinedArtifactsDir(artifactsDir);
+      touchWatch(confined);
       const id = safeAgentId(agentId);
       for (const dir of await agentDirs(confined)) {
         for (const kind of ["json", "md"] as const) {
@@ -384,23 +531,33 @@ export default experimental_defineHostEntry({
       throw new Error(`No output artifact for agent ${id}`);
     },
 
-    async watch({ path }, context) {
-      // watch accepts the same session dirs as agents_list; confinement is
-      // the same, but an invalid dir is merely not watched (boolean result).
-      const confined = await confinedArtifactsDir(path).catch(() => null);
-      if (confined === null) return { watched: false };
-      if (watches.has(watchKey(confined))) return { watched: true };
-      await startWatch(context, sessionUuidFromDir(confined), confined);
-      return { watched: true };
+    async agent_patch({ artifactsDir, agentId }) {
+      const confined = await confinedArtifactsDir(artifactsDir);
+      touchWatch(confined);
+      const id = safeAgentId(agentId);
+      for (const dir of await agentDirs(confined)) {
+        const file = join(dir, `${id}.patch`);
+        if ((await regularFileSize(file)) === null) continue;
+        const head = await readHead(file, 256 * 1024);
+        if (head === null) continue;
+        const clipped = clipOutput(head.text);
+        return { content: clipped.content, truncated: clipped.truncated || head.truncated };
+      }
+      throw new Error(`No patch for agent ${id}`);
     },
   },
 
   async dispose() {
-    for (const state of watches.values()) {
-      await state.subscription.dispose();
-      await state.lease.dispose();
-    }
+    generation += 1;
+    // Starts still in flight see the new generation and release their own
+    // subscription; wait for them so dispose returns with nothing left open.
+    await Promise.allSettled([...pendingWatches.values()]);
+    stopSweepTimer();
+    const all = [...watches.values()];
     watches.clear();
+    transcriptCache.clear();
+    parentBatchCache.clear();
+    await Promise.all(all.map(releaseWatch));
   },
 });
 
@@ -411,7 +568,9 @@ async function startWatch(
   context: ExperimentalHostRpcContext<typeof hostSignals>,
   sessionUuid: string,
   artifactsDir: string,
+  startedIn: number,
 ): Promise<void> {
+  if (startedIn !== generation) return;
   const key = watchKey(artifactsDir);
   if (watches.has(key)) return;
   const inflight = pendingWatches.get(key);
@@ -432,16 +591,22 @@ async function startWatch(
           });
           return;
         }
-        await context.experimental_emitSignal("changed", {
-          sessionUuid,
-          paths: event.changes
-            .map((change) => change.path)
-            .filter((path) => AGENT_JSONL.test(path.split("/").pop() ?? "")),
-        });
+        // Tool logs and other shared artifacts churn constantly and change no
+        // roster field: only an agent's own files are worth a refetch.
+        const paths = event.changes
+          .map((change) => change.path)
+          .filter(isAgentArtifact);
+        if (paths.length === 0) return;
+        await context.experimental_emitSignal("changed", { sessionUuid, paths });
       },
     );
+    if (startedIn !== generation) {
+      await subscription.dispose();
+      return;
+    }
     const lease = context.experimental_retainWorker();
-    watches.set(key, { sessionUuid, subscription, lease });
+    watches.set(key, { sessionUuid, subscription, lease, lastUsedAtMs: Date.now() });
+    ensureSweepTimer();
   })();
   pendingWatches.set(key, created);
   try {

@@ -129,7 +129,13 @@ function readUsage(message: Record<string, unknown>): {
     return { input: null, output: null, costTotal: null, contextTokens: null };
   }
   const u = usage as Record<string, unknown>;
-  const input = typeof u.input === "number" ? u.input : null;
+  // Prompt tokens arrive split by cache state: with prompt caching `input` is
+  // only the uncached tail (often single digits), the bulk is in cacheRead and
+  // cacheWrite. "Tokens in" is all of them.
+  const parts = [u.input, u.cacheRead, u.cacheWrite].filter(
+    (part): part is number => typeof part === "number",
+  );
+  const input = parts.length === 0 ? null : parts.reduce((sum, part) => sum + part, 0);
   const output = typeof u.output === "number" ? u.output : null;
   const cost = u.cost;
   let costTotal: number | null = null;
@@ -146,18 +152,34 @@ function readUsage(message: Record<string, unknown>): {
   return { input, output, costTotal, contextTokens };
 }
 
-/** Parse one subagent transcript into a roster row. */
-export function parseAgentFile(
-  id: string,
-  lines: readonly string[],
-  mtimeMs: number,
-  now: number,
-  artifacts: {
-    hasMd: boolean;
-    hasJson: boolean;
-    hasPatch: boolean;
-  },
-): AgentSummary {
+/**
+ * What a transcript says on its own, independent of the clock and of the
+ * artifact files next to it. `finalizeAgent` turns it into a roster row, so a
+ * parse can be cached per file version while the status stays a function of
+ * `now`.
+ */
+export type ParsedAgent = Omit<
+  AgentSummary,
+  | "status"
+  | "indicator"
+  | "error"
+  | "activeSeconds"
+  | "hasMd"
+  | "hasJson"
+  | "hasPatch"
+  | "nested"
+  | "spawnedInLatestBatch"
+> & {
+  interrupted: boolean;
+  aborted: boolean;
+  failedTurn: boolean;
+  settledTurn: boolean;
+  exited: boolean;
+  lastError: string | null;
+};
+
+/** Parse one subagent transcript's rows. Pure in `lines`: no clock, no files. */
+export function parseAgentRows(id: string, lines: readonly string[]): ParsedAgent {
   let agent: string | null = null;
   let modelRole: string | null = null;
   let resolvedModel: string | null = null;
@@ -281,16 +303,55 @@ export function parseAgentFile(
     }
   }
 
-  const interrupted =
-    exitReason !== null && exitReason !== "dispose" && exitReason !== "normal";
-  // OMP keeps a finished subagent's session open (it parks it later), so a
-  // clean end is the transcript's own final turn, not a `session_exit` row.
-  const settledTurn =
-    yieldAccepted || (lastStopReason === "stop" && !lastAssistantHadToolCall);
-  const aborted = lastStopReason === "aborted";
-  const failedTurn = lastStopReason === "error" || lastStopReason === "length";
-  const exited = endedAtMs !== null;
-  const fresh = now - (lastActivityAtMs ?? mtimeMs) <= LIVE_WINDOW_MS;
+  return {
+    id,
+    agent,
+    modelRole,
+    resolvedModel,
+    readOnly,
+    task,
+    createdAtMs,
+    endedAtMs,
+    lastActivityAtMs,
+    currentTool,
+    currentToolIntent,
+    toolCount,
+    requestCount,
+    tokensIn: sawUsage ? tokensIn : null,
+    tokensOut: sawUsage ? tokensOut : null,
+    contextTokens: lastContextTokens,
+    costTotal: sawCost ? Number(costTotal.toFixed(4)) : null,
+    interrupted:
+      exitReason !== null && exitReason !== "dispose" && exitReason !== "normal",
+    aborted: lastStopReason === "aborted",
+    failedTurn: lastStopReason === "error" || lastStopReason === "length",
+    // OMP keeps a finished subagent's session open (it parks it later), so a
+    // clean end is the transcript's own final turn, not a `session_exit` row.
+    settledTurn:
+      yieldAccepted || (lastStopReason === "stop" && !lastAssistantHadToolCall),
+    exited: endedAtMs !== null,
+    lastError,
+  };
+}
+
+/**
+ * The clock- and file-dependent half of a roster row: whether the agent is
+ * still live at `now`, how long it was active, and which artifacts exist.
+ * Returns a fresh object each call, so callers may mutate it.
+ */
+export function finalizeAgent(
+  parsed: ParsedAgent,
+  mtimeMs: number,
+  now: number,
+  artifacts: {
+    hasMd: boolean;
+    hasJson: boolean;
+    hasPatch: boolean;
+  },
+): AgentSummary {
+  const { interrupted, aborted, failedTurn, settledTurn, exited, lastError, ...row } =
+    parsed;
+  const fresh = now - (row.lastActivityAtMs ?? mtimeMs) <= LIVE_WINDOW_MS;
   let status: AgentStatus;
   if (interrupted || aborted) status = "interrupted";
   else if (failedTurn && (exited || !fresh)) status = "failed";
@@ -307,29 +368,13 @@ export function parseAgentFile(
           ? "unread-error"
           : "none";
 
-  const from = createdAtMs ?? lastActivityAtMs ?? mtimeMs;
-  const to = lastActivityAtMs ?? mtimeMs;
+  const from = row.createdAtMs ?? row.lastActivityAtMs ?? mtimeMs;
+  const to = row.lastActivityAtMs ?? mtimeMs;
   const activeSeconds = to > from ? Math.round((to - from) / 1000) : null;
 
   return {
-    id,
-    agent,
-    modelRole,
-    resolvedModel,
-    readOnly,
+    ...row,
     status,
-    task,
-    createdAtMs,
-    endedAtMs,
-    lastActivityAtMs,
-    currentTool,
-    currentToolIntent,
-    toolCount,
-    requestCount,
-    tokensIn: sawUsage ? tokensIn : null,
-    tokensOut: sawUsage ? tokensOut : null,
-    contextTokens: lastContextTokens,
-    costTotal: sawCost ? Number(costTotal.toFixed(4)) : null,
     hasMd: artifacts.hasMd,
     hasJson: artifacts.hasJson,
     hasPatch: artifacts.hasPatch,
@@ -339,6 +384,21 @@ export function parseAgentFile(
     error: status === "failed" ? lastError : null,
     spawnedInLatestBatch: false, // caller sets from the parent's newest batch
   };
+}
+
+/** Parse one subagent transcript into a roster row. */
+export function parseAgentFile(
+  id: string,
+  lines: readonly string[],
+  mtimeMs: number,
+  now: number,
+  artifacts: {
+    hasMd: boolean;
+    hasJson: boolean;
+    hasPatch: boolean;
+  },
+): AgentSummary {
+  return finalizeAgent(parseAgentRows(id, lines), mtimeMs, now, artifacts);
 }
 
 /**

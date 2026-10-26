@@ -14,14 +14,26 @@ them where you are looking.
   intent while it runs, tool count after it settles). It stays after the
   agents finish. Click an agent to open its history in the side panel.
 - **A roster panel.** The header chip `N subagents` opens a side panel with
-  every agent of the thread: status, agent type, model, tools, tokens, cost,
-  and its latest action. Open one to read its transcript or its final output.
+  every agent of the thread as a tree (`Parent.Child` under `Parent`): status,
+  agent type, model, tools, tokens, cost, a read-only marker, and its latest
+  action. The header sums tokens and cost and filters by status. Tokens in
+  count every prompt token, cached ones included (`input` + `cacheRead` +
+  `cacheWrite`). Open an agent to read its transcript, its final output, or
+  the patch of an isolated run; a failed agent shows its error.
 - **Messaging.** A box at the bottom of the panel sends a message to the OMP
   session through BB: it starts a turn when the thread is idle and steers it
-  when it is running.
+  when it is running. While an agent runs, its own panel has a box that asks
+  the main agent to forward the message to that agent.
+- **Status outside the thread.** The sidebar row of an OMP thread says how
+  many subagents run or failed in the latest batch, and a toast reports an
+  agent that fails, with a button that opens it.
+- **Commands.** `Open OMP subagents` and `Open next running subagent` in the
+  command palette, and `Open OMP subagents` in the thread actions menu.
 - **An OMP sessions page** in the navigation rail, listing the OMP sessions on
   your machines with their subagent counts.
-- **A CLI**, `bb omp-subagents`, with a skill that teaches agents to use it.
+- **A CLI**, `bb omp-subagents`, with a skill that teaches agents to use it,
+  and two read-only agent tools, `omp_subagents_roster` and
+  `omp_subagent_read`.
 
 Statuses are read from each transcript: `running` (written to in the last
 90 s), `finished`, `failed` (last turn ended in an error), `interrupted`
@@ -47,8 +59,10 @@ bb omp-subagents list [--json]
 bb omp-subagents agents <thread-id> [--json]
 bb omp-subagents transcript <thread-id> <agent> [--json]
 bb omp-subagents output <thread-id> <agent> [--json]
-bb omp-subagents inject <thread-id> <message>
+bb omp-subagents inject [--json] [--agent <id>] <thread-id> <message>
 ```
+
+For `inject`, everything after `<thread-id>` is the message, verbatim.
 
 ## How it works
 
@@ -57,9 +71,16 @@ bb omp-subagents inject <thread-id> <message>
   directory for changes. Every path is confined: `artifactsDir` must
   `realpath` to a session directory directly under the sessions root, agent
   ids are flat basenames, and artifacts are read only if they are regular
-  files (a symlink out of the tree is not followed).
+  files (a symlink out of the tree is not followed). Parsed transcripts are
+  cached by path, mtime and size, so a refresh re-reads only changed files. A
+  session's watch is released after 5 minutes without a roster read.
 - `server.ts` maps a BB thread to its OMP session through the
-  `thread/identity` event and relays host file-watch signals over BB realtime.
+  `thread/identity` event, caches the session directory, and relays host
+  file-watch signals over BB realtime. A signal fires only for agent files
+  (`.jsonl`, `.md`, `.json`, `.patch`).
+- `src/roster-store.ts` is one roster per thread, shared by the chip, the
+  panel and every strip: one request in flight, realtime refreshes for its own
+  session only, and a fallback poll.
 - `src/timeline.tsx` is a content script that mounts the strip under `task`
   rows. It finds a row's tool-call arguments through React fiber internals of
   BB's timeline, which is not a public API: a BB update can break the lookup.
@@ -70,9 +91,18 @@ bb omp-subagents inject <thread-id> <message>
 ## Limits
 
 - Messages go to the OMP main agent. OMP has no external channel for steering
-  one subagent, and this plugin does not kill or revive agents.
-- The strip refreshes by polling (4 s while an agent runs, 15 s after).
+  one subagent: a message to an agent is a request that the main agent
+  forwards. This plugin does not kill or revive agents.
+- Updates come from file watching; the fallback poll is 10 s while an agent
+  runs and 30 s after. A thread that is no longer on screen is polled only
+  until its running agents settle.
 - Only the newest 500 transcript entries are shown for a long agent.
+- The agent tools reach an OMP session when it starts; a session that was
+  already running sees them after a restart.
+- The sidebar row status and the row menu's `Open OMP subagents` show in
+  BB's own thread list. A thread list plugin that draws its own rows and menu
+  (such as `bb-sidebar`) shows them only if it renders plugin row statuses
+  and thread actions.
 
 ## Development
 

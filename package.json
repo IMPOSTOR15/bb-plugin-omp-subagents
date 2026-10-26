@@ -39,7 +39,7 @@
   },
   "scripts": {
     "build": "bb plugin build",
-    "test": "node --experimental-strip-types --test tests/host-confinement.test.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

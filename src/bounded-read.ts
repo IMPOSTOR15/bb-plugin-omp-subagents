@@ -4,14 +4,19 @@ import { lstat, open } from "node:fs/promises";
 
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 
-/** The size of a regular file (never a symlink) within the bound, else null. */
-export async function regularFileSize(path: string): Promise<number | null> {
+/** Size and mtime of a regular file (never a symlink) within the bound, else null. */
+export async function regularFileStat(path: string): Promise<{ size: number; mtimeMs: number } | null> {
   try {
     const st = await lstat(path);
-    return st.isFile() && st.size <= MAX_FILE_BYTES ? st.size : null;
+    return st.isFile() && st.size <= MAX_FILE_BYTES ? { size: st.size, mtimeMs: st.mtimeMs } : null;
   } catch {
     return null;
   }
+}
+
+/** The size of a regular file (never a symlink) within the bound, else null. */
+export async function regularFileSize(path: string): Promise<number | null> {
+  return (await regularFileStat(path))?.size ?? null;
 }
 
 /** Bytes kept from the start of an oversized file: session_init carries a ~25 KB system prompt. */

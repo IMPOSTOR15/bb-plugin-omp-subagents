@@ -23,6 +23,7 @@ import type {
   HostSessionsListResult,
   SessionSummary,
 } from "./src/contract.ts";
+import { clipReport, rosterText, transcriptText } from "./src/text-report.ts";
 
 const OMP_PROVIDER_ID = "acp-omp";
 const REALTIME_CHANGED = "agents-changed";
@@ -60,10 +61,22 @@ export const rpcContract = defineRpcContract({
       truncated: z.boolean(),
     }),
   },
+  agent_patch: {
+    input: z.object({
+      threadId: z.string().min(1),
+      agentId: agentIdSchema,
+    }),
+    output: z.object({
+      content: z.string(),
+      truncated: z.boolean(),
+    }),
+  },
   agent_inject: {
     input: z.object({
       threadId: z.string().min(1),
       text: z.string().trim().min(1).max(8000),
+      // Address one live subagent: the OMP main agent is asked to forward it.
+      agentId: agentIdSchema.nullable().optional(),
     }),
     output: z.object({
       delivery: z.enum(["sent", "queued"]),
@@ -91,60 +104,28 @@ export const rpcContract = defineRpcContract({
 type OmpBinding = {
   sessionUuid: string;
   hostId: string;
+  /** The session's artifacts dir on the host; null until `session_find` finds it. */
+  artifactsDir: string | null;
+  /** The thread saw new events since the identity was last checked. */
+  identityStale: boolean;
 };
 
-/** A server-side cache: threadId -> resolved OMP binding. */
-const bindings = new Map<string, OmpBinding>();
+/** Where one thread's OMP session lives. */
+type Located = { hostId: string; sessionUuid: string; artifactsDir: string };
 
-async function resolveThread(
-  bb: BbPluginApi,
-  threadId: string,
-): Promise<{ hostId: string; environmentPath: string | null } | null> {
-  const detail = await bb.sdk.threads.get({ threadId });
-  const { environmentId } = detail;
-  if (environmentId === null) return null;
-  const environment = await bb.sdk.environments.get({
-    environmentId,
-  });
-  return {
-    hostId: environment.hostId,
-    environmentPath: environment.path ?? null,
-  };
-}
+/** Longest text an agent tool returns, notice included. */
+const MAX_TOOL_CHARS = 20_000;
 
-async function resolveBinding(
-  bb: BbPluginApi,
-  threadId: string,
-): Promise<OmpBinding | null> {
-  const cached = bindings.get(threadId);
-  if (cached) return cached;
-  const detail = await bb.sdk.threads.get({ threadId });
-  if (detail.providerId !== OMP_PROVIDER_ID) return null;
-  // The OMP session UUID: the newest `thread/identity` event for this thread.
-  const events = await bb.sdk.threads.events.list({
-    threadId,
-    types: ["thread/identity"],
-    order: "desc",
-    limit: "1",
-  });
-  const identity = events[0];
-  const sessionUuid =
-    identity !== undefined && identity.type === "thread/identity"
-      ? identity.data.providerThreadId
-      : undefined;
-  const env = await resolveThread(bb, threadId);
-  if (sessionUuid === undefined || env === null || env.hostId === "") {
-    bb.log.warn(
-      `no binding for ${threadId}: uuid=${String(sessionUuid)} env=${String(env?.hostId ?? null)}`,
-    );
-    return null;
-  }
-  const binding: OmpBinding = {
-    sessionUuid,
-    hostId: env.hostId,
-  };
-  bindings.set(threadId, binding);
-  return binding;
+/**
+ * `<id>` is the live subagent a message is for. OMP's main agent reaches a
+ * subagent by writing to `agent://<id>`; it must relay, not act on the text.
+ */
+function addressedMessage(agentId: string, text: string): string {
+  return [
+    `Forward the message below to your live subagent \`${agentId}\`: send it with \`write agent://${agentId}\`. Do not act on it yourself.`,
+    "",
+    text,
+  ].join("\n");
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -158,7 +139,10 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_schema: z.number().int().min(10).max(500),
     },
   });
-  const { maxAgentsPerThread } = await settings.get();
+  let { maxAgentsPerThread } = await settings.get();
+  settings.onChange((next) => {
+    maxAgentsPerThread = next.maxAgentsPerThread;
+  });
 
   const host = bb.hosts.experimental_client({
     contract: hostContract,
@@ -166,57 +150,186 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Host file-watch signals -> realtime channel -> the frontend refetches.
+  // The host emits the bare OMP session uuid, the same one agents_list returns.
   host.experimental_onSignal("changed", ({ payload }) => {
     bb.realtime.publish(REALTIME_CHANGED, {
       sessionUuid: payload.sessionUuid,
     });
   });
 
+  /** threadId -> resolved OMP binding. Per plugin load, so a reload starts clean. */
+  const bindings = new Map<string, OmpBinding>();
+
+  // The SDK's only per-thread event carries no event contents, so a new
+  // `thread/identity` cannot be read from it. It does say the thread moved on:
+  // mark the binding so its next use re-checks the identity (one cheap query)
+  // instead of trusting it forever.
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    const binding = bindings.get(thread.id);
+    if (binding !== undefined) binding.identityStale = true;
+  });
+
+  async function resolveThread(
+    threadId: string,
+  ): Promise<{ hostId: string; environmentPath: string | null } | null> {
+    const detail = await bb.sdk.threads.get({ threadId });
+    const { environmentId } = detail;
+    if (environmentId === null) return null;
+    const environment = await bb.sdk.environments.get({
+      environmentId,
+    });
+    return {
+      hostId: environment.hostId,
+      environmentPath: environment.path ?? null,
+    };
+  }
+
+  /** The OMP session UUID: the newest `thread/identity` event for the thread. */
+  async function latestIdentity(threadId: string): Promise<string | undefined> {
+    const events = await bb.sdk.threads.events.list({
+      threadId,
+      types: ["thread/identity"],
+      order: "desc",
+      limit: "1",
+    });
+    const identity = events[0];
+    return identity !== undefined && identity.type === "thread/identity"
+      ? identity.data.providerThreadId
+      : undefined;
+  }
+
+  async function resolveBinding(threadId: string): Promise<OmpBinding | null> {
+    const cached = bindings.get(threadId);
+    if (cached) {
+      if (!cached.identityStale) return cached;
+      if ((await latestIdentity(threadId)) === cached.sessionUuid) {
+        cached.identityStale = false;
+        return cached;
+      }
+      bindings.delete(threadId);
+    }
+    const detail = await bb.sdk.threads.get({ threadId });
+    if (detail.providerId !== OMP_PROVIDER_ID) return null;
+    const sessionUuid = await latestIdentity(threadId);
+    const env = await resolveThread(threadId);
+    if (sessionUuid === undefined || env === null || env.hostId === "") {
+      bb.log.warn(
+        `no binding for ${threadId}: uuid=${String(sessionUuid)} env=${String(env?.hostId ?? null)}`,
+      );
+      return null;
+    }
+    const binding: OmpBinding = {
+      sessionUuid,
+      hostId: env.hostId,
+      artifactsDir: null,
+      identityStale: false,
+    };
+    bindings.set(threadId, binding);
+    return binding;
+  }
+
   async function hostForThread(threadId: string): Promise<{
     hostId: string;
     sessionUuid: string;
   } | null> {
-    const binding = await resolveBinding(bb, threadId);
+    const binding = await resolveBinding(threadId);
     if (binding === null) return null;
     return { hostId: binding.hostId, sessionUuid: binding.sessionUuid };
   }
 
   /** Artifacts dir on the host, resolved by session uuid (no listing cap). */
-  async function artifactsDirFor(
-    hostId: string,
-    sessionUuid: string,
-  ): Promise<string | null> {
+  async function findArtifactsDir(binding: OmpBinding): Promise<string | null> {
     const { artifactsDir } = await host.call(
       "session_find",
-      { uuid: sessionUuid },
-      { hostId, timeoutMs: 30000 },
+      { uuid: binding.sessionUuid },
+      { hostId: binding.hostId, timeoutMs: 30000 },
     );
     return artifactsDir;
   }
 
-  async function threadContext(threadId: string): Promise<{
-    hostId: string;
-    sessionUuid: string;
-    artifactsDir: string | null;
-  } | null> {
-    const thread = await hostForThread(threadId);
-    if (thread === null) {
-      bb.log.warn(`threadContext(${threadId}): no binding`);
+  /**
+   * Binding plus artifacts dir; the dir is cached in the binding, so a session
+   * scan runs once per binding, not once per RPC. `fromCache` says the binding
+   * was reused rather than resolved by this call. `located` is null when the
+   * session is not on the host (yet). The result is null when the thread is
+   * not an OMP thread with an identity.
+   */
+  async function locate(
+    threadId: string,
+  ): Promise<{ located: Located | null; fromCache: boolean } | null> {
+    const before = bindings.get(threadId);
+    const binding = await resolveBinding(threadId);
+    if (binding === null) {
+      bb.log.warn(`locate(${threadId}): no binding`);
       return null;
     }
-    const artifactsDir = await artifactsDirFor(thread.hostId, thread.sessionUuid);
-    if (artifactsDir === null) {
-      bb.log.warn(
-        `threadContext(${threadId}): uuid ${thread.sessionUuid} not found in sessions_list`,
-      );
-      return null;
+    const fromCache = before === binding;
+    if (binding.artifactsDir === null) {
+      const found = await findArtifactsDir(binding);
+      if (found === null) {
+        bb.log.warn(`locate(${threadId}): uuid ${binding.sessionUuid} not found on host`);
+        return { located: null, fromCache };
+      }
+      binding.artifactsDir = found;
     }
-    return { ...thread, artifactsDir };
+    return {
+      located: {
+        hostId: binding.hostId,
+        sessionUuid: binding.sessionUuid,
+        artifactsDir: binding.artifactsDir,
+      },
+      fromCache,
+    };
   }
 
+  /**
+   * Run `run` against the thread's session. The cached binding/dir may have
+   * gone stale (identity changed, session moved), so it is re-resolved once
+   * when the session is not found, or when `run` fails and the dir now resolves
+   * elsewhere. A failure with the dir still correct is the real answer and is
+   * rethrown. Null: not an OMP thread, or no session on its host.
+   */
+  async function onThread<T>(
+    threadId: string,
+    run: (located: Located) => Promise<T>,
+  ): Promise<T | null> {
+    const first = await locate(threadId);
+    if (first === null) return null;
+    if (first.located === null) {
+      if (!first.fromCache) return null;
+      bindings.delete(threadId);
+      const retry = await locate(threadId);
+      return retry?.located == null ? null : run(retry.located);
+    }
+    try {
+      return await run(first.located);
+    } catch (error) {
+      if (!first.fromCache) throw error;
+      bindings.delete(threadId);
+      const retry = await locate(threadId);
+      if (retry?.located == null || retry.located.artifactsDir === first.located.artifactsDir) {
+        throw error;
+      }
+      return run(retry.located);
+    }
+  }
+
+  const notOmp = (threadId: string) =>
+    new Error(`Thread ${threadId} is not an OMP session`);
+
   const agentsList = async (threadId: string) => {
-    const context = await threadContext(threadId);
-    if (context === null || context.artifactsDir === null) {
+    const result = await onThread(threadId, async (located) => ({
+      located,
+      // Each call keeps the host's watch for this session alive.
+      agents: (
+        await host.call(
+          "agents_list",
+          { artifactsDir: located.artifactsDir },
+          { hostId: located.hostId, timeoutMs: 30000 },
+        )
+      ).agents,
+    }));
+    if (result === null) {
       return {
         sessionUuid: null,
         artifactsDir: null,
@@ -224,61 +337,76 @@ export default async function plugin(bb: BbPluginApi) {
         agents: [] satisfies AgentSummary[],
       };
     }
-    const result = await host.call(
-      "agents_list",
-      { artifactsDir: context.artifactsDir },
-      { hostId: context.hostId, timeoutMs: 30000 },
-    );
-    // Watch for live updates while the roster is open.
-    await host.call(
-      "watch",
-      { path: context.artifactsDir },
-      { hostId: context.hostId, timeoutMs: 30000 },
-    );
     return {
-      sessionUuid: context.sessionUuid,
-      artifactsDir: context.artifactsDir,
-      hostId: context.hostId,
+      sessionUuid: result.located.sessionUuid,
+      artifactsDir: result.located.artifactsDir,
+      hostId: result.located.hostId,
       agents: result.agents.slice(0, maxAgentsPerThread),
     };
   };
 
   const agentTranscript = async (threadId: string, agentId: string) => {
-    const context = await threadContext(threadId);
-    if (context === null || context.artifactsDir === null) {
-      throw new Error(`Thread ${threadId} is not an OMP session`);
-    }
-    return host.call(
-      "agent_transcript",
-      { artifactsDir: context.artifactsDir, agentId },
-      { hostId: context.hostId, timeoutMs: 30000 },
+    const result = await onThread(threadId, (located) =>
+      host.call(
+        "agent_transcript",
+        { artifactsDir: located.artifactsDir, agentId },
+        { hostId: located.hostId, timeoutMs: 30000 },
+      ),
     );
+    if (result === null) throw notOmp(threadId);
+    return result;
   };
 
   const agentOutput = async (threadId: string, agentId: string) => {
-    const context = await threadContext(threadId);
-    if (context === null || context.artifactsDir === null) {
-      throw new Error(`Thread ${threadId} is not an OMP session`);
-    }
-    return host.call(
-      "agent_output",
-      { artifactsDir: context.artifactsDir, agentId },
-      { hostId: context.hostId, timeoutMs: 30000 },
+    const result = await onThread(threadId, (located) =>
+      host.call(
+        "agent_output",
+        { artifactsDir: located.artifactsDir, agentId },
+        { hostId: located.hostId, timeoutMs: 30000 },
+      ),
     );
+    if (result === null) throw notOmp(threadId);
+    return result;
   };
 
-  const agentInject = async (threadId: string, text: string) => {
+  const agentPatch = async (threadId: string, agentId: string) => {
+    const result = await onThread(threadId, (located) =>
+      host.call(
+        "agent_patch",
+        { artifactsDir: located.artifactsDir, agentId },
+        { hostId: located.hostId, timeoutMs: 30000 },
+      ),
+    );
+    if (result === null) throw notOmp(threadId);
+    return result;
+  };
+
+  const agentInject = async (
+    threadId: string,
+    text: string,
+    agentId: string | null | undefined,
+  ) => {
+    const addressee =
+      agentId === null || agentId === undefined
+        ? null
+        : agentIdSchema.parse(agentId);
     // Route through bb's own dispatch: send-mode "auto" starts a turn on an
     // idle thread and queues/steers a running one — exactly what steering a
     // live OMP main agent needs.
     const detail = await bb.sdk.threads.get({ threadId });
     if (detail.providerId !== OMP_PROVIDER_ID) {
-      throw new Error(`Thread ${threadId} is not an OMP session`);
+      throw notOmp(threadId);
     }
     const result = await bb.sdk.threads.send({
       threadId,
       mode: "auto",
-      input: [{ type: "text", text, mentions: [] }],
+      input: [
+        {
+          type: "text",
+          text: addressee === null ? text : addressedMessage(addressee, text),
+          mentions: [],
+        },
+      ],
     });
     return { delivery: result.delivery };
   };
@@ -292,7 +420,10 @@ export default async function plugin(bb: BbPluginApi) {
     agent_output: ({ threadId, agentId }) =>
       agentOutput(threadId, agentId),
 
-    agent_inject: ({ threadId, text }) => agentInject(threadId, text),
+    agent_patch: ({ threadId, agentId }) => agentPatch(threadId, agentId),
+
+    agent_inject: ({ threadId, text, agentId }) =>
+      agentInject(threadId, text, agentId),
 
     sessions_list: async ({ projectId }) => {
       const threads = (
@@ -307,7 +438,7 @@ export default async function plugin(bb: BbPluginApi) {
       await Promise.all(
         Array.from({ length: Math.min(6, queue.length) }, async () => {
           for (let thread = queue.shift(); thread; thread = queue.shift()) {
-            const binding = await resolveBinding(bb, thread.id);
+            const binding = await resolveBinding(thread.id);
             if (binding !== null) bound.push({ thread, binding });
           }
         }),
@@ -365,20 +496,103 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  // ---- Agent tools: read-only, mirroring the CLI read paths -------------------
+
+  bb.agents.registerTool({
+    name: "omp_subagents_roster",
+    description:
+      "List the subagents of an OMP thread: status, tool count and task per agent. Read-only. Defaults to the current thread.",
+    presentation: {
+      label: {
+        pending: "Reading OMP subagents",
+        completed: "Read OMP subagents",
+      },
+    },
+    parameters: z.object({
+      threadId: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("BB thread id of an OMP thread; default: this thread"),
+    }),
+    async execute({ threadId }, ctx) {
+      const target = threadId ?? ctx.threadId;
+      const result = await agentsList(target);
+      if (result.sessionUuid === null) {
+        throw new Error(`Thread ${target} has no OMP session on its host`);
+      }
+      return clipReport(rosterText(result.agents), MAX_TOOL_CHARS, "head");
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "omp_subagent_read",
+    description:
+      "Read one OMP subagent's final output or its transcript (agent ids come from omp_subagents_roster). Read-only. Defaults to the current thread.",
+    presentation: {
+      label: {
+        pending: "Reading OMP subagent",
+        completed: "Read OMP subagent",
+      },
+    },
+    parameters: z.object({
+      agentId: agentIdSchema.describe("Agent id from the roster, e.g. ReviewAuth or Parent.Child"),
+      part: z
+        .enum(["output", "transcript"])
+        .default("output")
+        .describe("output: final result artifact; transcript: chronological feed, newest last"),
+      threadId: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("BB thread id of an OMP thread; default: this thread"),
+    }),
+    async execute({ agentId, part, threadId }, ctx) {
+      const target = threadId ?? ctx.threadId;
+      if (part === "transcript") {
+        const { entries, truncated } = await agentTranscript(target, agentId);
+        const note = truncated ? "[older transcript rows omitted]\n" : "";
+        return clipReport(`${note}${transcriptText(entries)}`, MAX_TOOL_CHARS, "tail");
+      }
+      const result = await agentOutput(target, agentId);
+      const note = result.truncated ? "\n[output truncated at the source]" : "";
+      return clipReport(`${result.content}${note}`, MAX_TOOL_CHARS, "head");
+    },
+  });
+
+  // ---- CLI ------------------------------------------------------------------------
+
   // `bb omp-subagents` — what agents and shells use to inspect and steer.
   const usage = [
     "Usage:",
-    "  bb omp-subagents list [--json]                        Machine sessions with subagent counts",
+    "  bb omp-subagents list [--json]                        Sessions on every machine, with subagent counts",
     "  bb omp-subagents agents <thread-id> [--json]          Roster for one OMP thread",
     "  bb omp-subagents transcript <thread-id> <agent> [--json]",
     "  bb omp-subagents output <thread-id> <agent> [--json]  Final output artifact",
-    "  bb omp-subagents inject <thread-id> <message>         Send a message into an OMP thread",
+    "  bb omp-subagents inject [--json] [--agent <id>] <thread-id> <message>",
+    "                                                        Send a message into an OMP thread; with --agent the",
+    "                                                        main agent forwards it to that live subagent.",
+    "                                                        Everything after <thread-id> is the message.",
   ].join("\n");
+
+  /** Machines to list: every connected one, the primary, and each bound thread's. */
+  async function listingHosts(): Promise<string[]> {
+    const ids = new Set<string>();
+    const primary = await bb.sdk.system.config();
+    const primaryId = (primary as { primaryHostId?: string | null }).primaryHostId ?? "";
+    if (primaryId !== "") ids.add(primaryId);
+    for (const known of await bb.sdk.hosts.list()) {
+      if (known.status === "connected" && known.lifecycle.phase === "active") ids.add(known.id);
+    }
+    for (const binding of bindings.values()) ids.add(binding.hostId);
+    return [...ids];
+  }
+
   bb.cli.register({
     name: "omp-subagents",
     summary: "Inspect and steer the subagents of OMP threads",
     commands: [
-      { name: "list", summary: "List machine OMP sessions", usage: "bb omp-subagents list [--json]" },
+      { name: "list", summary: "List OMP sessions on every machine", usage: "bb omp-subagents list [--json]" },
       {
         name: "agents",
         summary: "Subagent roster for a thread",
@@ -396,78 +610,114 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "inject",
-        summary: "Send a message into an OMP thread",
-        usage: "bb omp-subagents inject <thread-id> <message>",
+        summary: "Send a message into an OMP thread, or to one of its live subagents",
+        usage: "bb omp-subagents inject [--json] [--agent <id>] <thread-id> <message>",
       },
     ],
     async run(argv) {
-      const json = argv.includes("--json");
-      const args = argv.filter((arg) => arg !== "--json");
-      const [command, ...rest] = args;
+      const args = [...argv];
+      let json = false;
+      while (args[0] === "--json") {
+        json = true;
+        args.shift();
+      }
+      const command = args.shift();
+      const usageError = (message?: string) => ({
+        exitCode: 1,
+        stderr: message === undefined ? usage : `${message}\n${usage}`,
+      });
       const reply = (value: unknown, text: string) => ({
         exitCode: 0,
         stdout: json ? JSON.stringify(value, null, 2) : text,
       });
+      if (command !== "inject" && args.includes("--json")) {
+        json = true;
+        for (let at = args.indexOf("--json"); at !== -1; at = args.indexOf("--json")) {
+          args.splice(at, 1);
+        }
+      }
       switch (command) {
         case undefined:
         case "help":
         case "--help":
           return { exitCode: 0, stdout: usage };
         case "list": {
-          const primary = await bb.sdk.system.config();
-          const hostId = (primary as { primaryHostId?: string | null }).primaryHostId ?? "";
-          if (hostId === "") return { exitCode: 1, stderr: "No enrolled host." };
-          const list = await host.call(
-            "sessions_list",
-            { limit: 40 },
-            { hostId, timeoutMs: 30000 },
+          const hostIds = await listingHosts();
+          if (hostIds.length === 0) return { exitCode: 1, stderr: "No enrolled host." };
+          const settled = await Promise.allSettled(
+            hostIds.map(async (hostId) => ({
+              hostId,
+              sessions: (
+                await host.call("sessions_list", { limit: 40 }, { hostId, timeoutMs: 30000 })
+              ).sessions,
+            })),
           );
-          const lines = list.sessions.map(
+          const merged = settled
+            .flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+            .flatMap(({ hostId, sessions }) => sessions.map((session) => ({ ...session, hostId })))
+            .sort((a, b) => b.lastModifiedAtMs - a.lastModifiedAtMs)
+            .slice(0, 40);
+          const failures = settled.flatMap((result, index) =>
+            result.status === "rejected"
+              ? [`${hostIds[index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
+              : [],
+          );
+          if (merged.length === 0 && failures.length === hostIds.length) {
+            return { exitCode: 1, stderr: `Could not list sessions:\n${failures.join("\n")}` };
+          }
+          const lines = merged.map(
             (session) =>
-              `${session.agentCount} agents  ${new Date(session.lastModifiedAtMs).toISOString()}  ${session.dir}/${session.sessionUuid}`,
+              `${session.agentCount} agents  ${new Date(session.lastModifiedAtMs).toISOString()}  ${session.dir}/${session.sessionUuid}` +
+              (hostIds.length > 1 ? `  [${session.hostId}]` : ""),
           );
-          return reply(
-            list.sessions,
-            lines.length === 0 ? "No OMP sessions." : lines.join("\n"),
-          );
+          const result = reply(merged, lines.length === 0 ? "No OMP sessions." : lines.join("\n"));
+          return failures.length === 0
+            ? result
+            : { ...result, stderr: `Skipped machines:\n${failures.join("\n")}` };
         }
         case "agents": {
-          const threadId = rest[0];
+          const threadId = args[0];
           if (threadId === undefined) break;
           const { agents } = await agentsList(threadId);
-          const lines = agents.map(
-            (agent) =>
-              `${agent.status.padEnd(10)} ${agent.id.padEnd(24)} ${agent.toolCount} tools  ${agent.task.slice(0, 80)}`,
-          );
-          return reply(
-            agents,
-            lines.length === 0 ? "No subagents." : lines.join("\n"),
-          );
+          return reply(agents, rosterText(agents));
         }
         case "transcript": {
-          const [threadId, agentId] = rest;
+          const [threadId, agentId] = args;
           if (threadId === undefined || agentId === undefined) break;
           const { entries } = await agentTranscript(threadId, agentId);
-          return reply(
-            entries,
-            entries.map((e) => `${e.role}: ${e.summary}`).join("\n"),
-          );
+          return reply(entries, transcriptText(entries));
         }
         case "output": {
-          const [threadId, agentId] = rest;
+          const [threadId, agentId] = args;
           if (threadId === undefined || agentId === undefined) break;
           const result = await agentOutput(threadId, agentId);
           return reply(result, result.content);
         }
         case "inject": {
-          const [threadId, ...messageParts] = rest;
-          const text = messageParts.join(" ").trim();
+          // Options come before <thread-id>; everything after it is the message,
+          // verbatim — including a literal "--json" or "--agent".
+          let agentId: string | null = null;
+          while (args[0]?.startsWith("--")) {
+            const option = args.shift();
+            if (option === "--json") json = true;
+            else if (option === "--agent") {
+              const value = args.shift();
+              const parsed = agentIdSchema.safeParse(value);
+              if (!parsed.success) return usageError("--agent needs a valid agent id.");
+              agentId = parsed.data;
+            } else return usageError(`Unknown option ${option}.`);
+          }
+          const threadId = args.shift();
+          const text = args.join(" ").trim();
           if (threadId === undefined || text === "") break;
-          const result = await agentInject(threadId, text);
-          return reply(result, `Message ${result.delivery} to ${threadId}`);
+          const result = await agentInject(threadId, text, agentId);
+          return reply(
+            result,
+            `Message ${result.delivery} to ${agentId === null ? threadId : `${agentId} via ${threadId}`}`,
+          );
         }
       }
-      return { exitCode: 1, stderr: usage };
+      return usageError();
     },
   });
 

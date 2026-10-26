@@ -17,7 +17,7 @@ const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-a
 import host from "../src/host.ts";
 import { clipBody, parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
-import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
+import { hubPanelParams, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
 import { GLYPHS, VERIFIED_BB_GLYPHS } from "../src/glyphs.ts";
 import { statusStyle } from "../src/status-style.ts";
 import { readHead, readLines } from "../src/bounded-read.ts";
@@ -115,6 +115,50 @@ describe("host confinement", () => {
     );
   });
 
+  it("reads a patch, also from a nested agent's folder", async () => {
+    await writeFile(join(session, "Parent", "Parent.Child.patch"), "diff --git a/x b/x\n+hello\n");
+    const out = (await handlers.agent_patch!({ artifactsDir: session, agentId: "Parent.Child" })) as {
+      content: string;
+      truncated: boolean;
+    };
+    assert.match(out.content, /\+hello/);
+    assert.equal(out.truncated, false);
+  });
+
+  it("reads only the head of an oversized patch and flags it truncated", async () => {
+    await writeFile(join(session, "HugePatch.patch"), "é".repeat(400_000));
+    const out = (await handlers.agent_patch!({ artifactsDir: session, agentId: "HugePatch" })) as {
+      content: string;
+      truncated: boolean;
+    };
+    assert.equal(out.truncated, true);
+    assert.ok(!out.content.includes("\ufffd"), "cut must not split a multi-byte character");
+  });
+
+  it("rejects an agent that left no patch, even when it has other artifacts", async () => {
+    await assert.rejects(
+      () => handlers.agent_patch!({ artifactsDir: session, agentId: "AgentA" }),
+      /No patch for agent AgentA/,
+    );
+  });
+
+  it("does not follow a symlinked patch out of the tree", async () => {
+    await writeFile(join(outside, "secret.patch"), "TOP SECRET\n");
+    await symlink(join(outside, "secret.patch"), join(session, "LeakPatch.patch"));
+    await assert.rejects(
+      () => handlers.agent_patch!({ artifactsDir: session, agentId: "LeakPatch" }),
+      /No patch for agent/,
+    );
+  });
+
+  it("confines agent_patch like the other reads", async () => {
+    await assert.rejects(() => handlers.agent_patch!({ artifactsDir: "/etc", agentId: "AgentA" }));
+    await assert.rejects(
+      () => handlers.agent_patch!({ artifactsDir: session, agentId: "../../x" }),
+      /invalid agent id/,
+    );
+  });
+
   it("gives one generic error for missing and out-of-root paths", async () => {
     const messages: string[] = [];
     for (const dir of ["/etc", "/definitely/not/here"]) {
@@ -144,9 +188,17 @@ describe("host confinement", () => {
     assert.ok(result.entries.every((e) => !e.summary.includes("\ufffd")), "no broken character");
   });
 
-  it("watch outside the root is refused, not started", async () => {
-    const result = (await handlers.watch!({ path: "/etc" }, ctx)) as { watched: boolean };
-    assert.equal(result.watched, false);
+  it("a roster outside the root is refused and no watch is started", async () => {
+    let started = 0;
+    const counting = {
+      ...ctx,
+      experimental_watch: async () => {
+        started += 1;
+        return { dispose: async () => undefined };
+      },
+    };
+    await assert.rejects(() => handlers.agents_list!({ artifactsDir: "/etc" }, counting));
+    assert.equal(started, 0);
   });
 
   it("session_find resolves a bare uuid", async () => {
@@ -247,6 +299,29 @@ describe("parseAgentFile status", () => {
   });
 });
 
+describe("token usage", () => {
+  // The shape OMP writes with prompt caching: `input` is only the uncached tail.
+  const turn = (ms: number, usage: Record<string, unknown>) =>
+    JSON.stringify({ type: "message", timestamp: new Date(ms).toISOString(), message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }], usage } });
+  const artifacts = { hasMd: false, hasJson: false, hasPatch: false };
+
+  it("tokens in counts cached prompt tokens, in the roster and in the transcript", () => {
+    const lines = [
+      turn(1_000, { input: 4, output: 173, cacheRead: 0, cacheWrite: 16257, cost: { total: 0.04 } }),
+      turn(2_000, { input: 2, output: 143, cacheRead: 16257, cacheWrite: 672, cost: { total: 0.005 } }),
+    ];
+    const a = parseAgentFile("x", lines, 2_000, 2_000, artifacts);
+    assert.equal(a.tokensIn, 4 + 16257 + 2 + 16257 + 672);
+    assert.equal(a.tokensOut, 173 + 143);
+    assert.equal(parseTranscript(lines).entries[1]!.tokensIn, 2 + 16257 + 672);
+  });
+
+  it("a provider without cache fields still reports plain input", () => {
+    const a = parseAgentFile("x", [turn(1_000, { input: 120, output: 30 })], 1_000, 1_000, artifacts);
+    assert.equal(a.tokensIn, 120);
+  });
+});
+
 describe("parseTranscript", () => {
   it("keeps the newest entries when the feed overflows", () => {
     const lines = Array.from({ length: 700 }, (_, i) =>
@@ -284,11 +359,13 @@ describe("host watch registration", () => {
       experimental_emitSignal: async () => undefined,
     };
     await Promise.all([
-      handlers.watch!({ path: session }, slowCtx),
-      handlers.watch!({ path: session }, slowCtx),
+      handlers.agents_list!({ artifactsDir: session }, slowCtx),
+      handlers.agents_list!({ artifactsDir: session }, slowCtx),
+      handlers.agent_output!({ artifactsDir: session, agentId: "AgentA" }, slowCtx),
       handlers.agents_list!({ artifactsDir: session }, slowCtx),
     ]);
     assert.equal(started, 1);
+    await host.dispose?.();
   });
 });
 
@@ -467,13 +544,16 @@ describe("opening an agent from the strip", () => {
     }
   });
   it("panel params carry the thread and the agent to open", () => {
-    assert.deepEqual(parseHubParams({ threadId: "thr_1", agentId: "Scout-2", projectId: "p" }), { threadId: "thr_1", agentId: "Scout-2" });
-    assert.deepEqual(parseHubParams({ threadId: "thr_1" }), { threadId: "thr_1", agentId: null });
-    assert.deepEqual(parseHubParams(null), { threadId: null, agentId: null });
-    assert.deepEqual(parseHubParams({ threadId: 7, agentId: "" }), { threadId: null, agentId: null });
+    assert.deepEqual(parseHubParams({ threadId: "thr_1", agentId: "Scout-2", projectId: "p", openSeq: 3 }), { threadId: "thr_1", agentId: "Scout-2", openSeq: 3 });
+    assert.deepEqual(parseHubParams({ threadId: "thr_1" }), { threadId: "thr_1", agentId: null, openSeq: null });
+    assert.deepEqual(parseHubParams(null), { threadId: null, agentId: null, openSeq: null });
+    assert.deepEqual(parseHubParams({ threadId: 7, agentId: "", openSeq: "1" }), { threadId: null, agentId: null, openSeq: null });
   });
-  it("uses one stable event name", () => {
-    assert.equal(OPEN_AGENT_EVENT, "omp-subagents:open-agent");
+  it("opening the same agent twice yields params that differ, so the panel re-points", () => {
+    const first = parseHubParams(hubPanelParams({ threadId: "thr_1", projectId: "p", agentId: "Scout-2" }));
+    const again = parseHubParams(hubPanelParams({ threadId: "thr_1", projectId: "p", agentId: "Scout-2" }));
+    assert.equal(again.agentId, first.agentId);
+    assert.notEqual(again.openSeq, first.openSeq);
   });
   it("only uses glyphs that exist in bb's icon set (an unknown name renders as a lightning bolt)", () => {
     for (const status of ["running", "finished", "failed", "interrupted", "partial"] as const) {

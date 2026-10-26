@@ -7,14 +7,33 @@
 //    live progress, per-agent transcript, final output, and message injection.
 //  * A nav panel that lists this machine's recent OMP sessions with their
 //    subagent counts.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import "./src/theme.css";
 import { activityLine } from "./src/activity.ts";
-import { OPEN_AGENT_EVENT, parseHubParams, parseOpenAgentRequest } from "./src/open-agent.ts";
+import {
+  hubPanelParams,
+  OPEN_AGENT_EVENT,
+  parseHubParams,
+  parseOpenAgentRequest,
+  requestOpenAgent,
+  takePendingOpen,
+} from "./src/open-agent.ts";
 import { GLYPHS } from "./src/glyphs.ts";
+import { splitPatchByFile } from "./src/patch-split.ts";
+import {
+  buildAgentTree,
+  filterByStatus,
+  flattenAgentTree,
+  nextRunningAgent,
+  rosterTotals,
+  statusCounts,
+} from "./src/roster-derive.ts";
+import { rosterStore } from "./src/roster-store.ts";
+import { syncRowStatuses } from "./src/row-status.ts";
 import { statusStyle } from "./src/status-style.ts";
 import { startTimelineStrip } from "./src/timeline.tsx";
+import { useRoster } from "./src/use-roster.ts";
 import {
   definePluginApp,
   useRealtime,
@@ -22,12 +41,16 @@ import {
   useRpc,
   useBbContext,
   useBbNavigate,
+  experimental_Diff as Diff,
+  experimental_THREAD_ACTION_GROUPS,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
+  experimental_useSidebarThreads,
   Markdown,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import type {
+  AgentStatus,
   AgentSummary,
   SessionSummary,
   TranscriptEntry,
@@ -40,50 +63,45 @@ import { cn } from "@/lib/utils";
 
 const REALTIME_CHANGED = "agents-changed";
 
-function useAgentRoster(threadId: string | null) {
-  const rpc = useRpc<typeof rpcContract>();
-  const [roster, setRoster] = useState<{
-    sessionUuid: string | null;
-    agents: AgentSummary[];
-  } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  const refetch = useCallback(() => {
-    if (threadId === null) {
-      setRoster(null);
-      return;
-    }
-    setLoading(true);
-    rpc
-      .call("agents_list", { threadId })
-      .then((result) => {
-        setRoster({ sessionUuid: result.sessionUuid, agents: result.agents });
-        setError(null);
-      })
-      .catch((cause: unknown) =>
-        setError(cause instanceof Error ? cause.message : String(cause)),
-      )
-      .finally(() => setLoading(false));
-  }, [rpc, threadId]);
-
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
-
-  // Live progress: the server republishes host watch signals on this channel.
-  useRealtime(REALTIME_CHANGED, () => refetch());
+/**
+ * Feeds the shared roster store from the plugin tree: the content script runs
+ * outside the plugin's providers and cannot use the realtime hooks itself.
+ * Mounted once per app window (`experimental_appOverlay`); renders nothing.
+ */
+function RosterFeed() {
+  useRealtime(REALTIME_CHANGED, (payload) => rosterStore.handleChanged(payload));
   // Signals are ephemeral and not replayed: reconcile after a reconnect.
   const connection = useRealtimeConnectionState();
   const wasConnected = useRef(false);
   useEffect(() => {
     if (connection === "connected") {
-      if (wasConnected.current) refetch();
+      if (wasConnected.current) rosterStore.reconcile();
       wasConnected.current = true;
     }
-  }, [connection, refetch]);
+  }, [connection]);
 
-  return { roster, error, loading, refetch };
+  // A subagent that ended in failure: say so, wherever the user is.
+  const navigate = useBbNavigate();
+  const { threadId: viewedThreadId } = useBbContext();
+  const viewed = useRef(viewedThreadId);
+  viewed.current = viewedThreadId;
+  useEffect(
+    () =>
+      rosterStore.onFailure(({ threadId, agent }) => {
+        toast.error(`${agent.id} failed`, {
+          ...(agent.error === null ? {} : { description: agent.error }),
+          action: {
+            label: "Open",
+            onClick: () => {
+              if (viewed.current !== threadId) navigate.toThread(threadId);
+              requestOpenAgent({ threadId, agentId: agent.id });
+            },
+          },
+        });
+      }),
+    [navigate],
+  );
+  return null;
 }
 
 function relativeTime(ms: number | null): string {
@@ -162,23 +180,30 @@ function HeaderChip({
   projectId: string;
   isCompactViewport: boolean;
 }) {
-  const { roster } = useAgentRoster(threadId);
+  const { roster } = useRoster(threadId);
   const navigate = useBbNavigate();
   const agents = roster?.agents ?? [];
   const running = agents.filter((agent) => agent.status === "running").length;
 
-  // A click on an agent in the timeline strip: open that agent's history here.
+  // A click on an agent in the timeline strip (or a failure toast's action):
+  // open that agent's history here. A request that arrived before this header
+  // mounted (the toast navigated to the thread first) is parked and taken now.
   useEffect(() => {
+    const open = (agentId: string) =>
+      navigate.openThreadPanel({
+        actionId: "hub",
+        title: agentId,
+        params: hubPanelParams({ threadId, projectId, agentId }),
+      });
+    const parked = takePendingOpen(threadId);
+    if (parked !== null) open(parked.agentId);
     const onOpen = (event: Event) => {
       const request = parseOpenAgentRequest(
         event instanceof CustomEvent ? event.detail : null,
       );
       if (request === null || request.threadId !== threadId) return;
-      navigate.openThreadPanel({
-        actionId: "hub",
-        title: request.agentId,
-        params: { threadId, projectId, agentId: request.agentId },
-      });
+      takePendingOpen(threadId);
+      open(request.agentId);
     };
     window.addEventListener(OPEN_AGENT_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_AGENT_EVENT, onOpen);
@@ -194,7 +219,7 @@ function HeaderChip({
         navigate.openThreadPanel({
           actionId: "hub",
           title: "OMP Subagents",
-          params: { threadId, projectId },
+          params: hubPanelParams({ threadId, projectId }),
         })
       }
     />
@@ -227,12 +252,25 @@ function StatusIcon({ status, size = "size-3.5" }: { status: AgentSummary["statu
   );
 }
 
+function ReadOnlyBadge() {
+  return (
+    <span
+      className="shrink-0 rounded-full border border-border px-1.5 text-2xs text-muted-foreground"
+      title="This agent cannot modify files"
+    >
+      read-only
+    </span>
+  );
+}
+
 function AgentRow({
   agent,
+  depth,
   selected,
   onSelect,
 }: {
   agent: AgentSummary;
+  depth: number;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -241,17 +279,20 @@ function AgentRow({
       type="button"
       onClick={onSelect}
       aria-current={selected}
+      style={depth > 0 ? { marginLeft: `${depth * 16}px`, width: `calc(100% - ${depth * 16}px)` } : undefined}
       className={cn(
         "w-full rounded-md border border-transparent px-3 py-2.5 text-left",
         "hover:border-border hover:bg-accent/50",
         selected && "border-border bg-accent",
+        depth > 0 && "border-l-border",
       )}
     >
       <div className="flex items-center gap-2">
         <StatusIcon status={agent.status} />
         <span className="min-w-0 flex-1 truncate text-sm font-medium">
-          {agent.id}
+          {depth > 0 ? agent.id.slice(agent.id.lastIndexOf(".") + 1) : agent.id}
         </span>
+        {agent.readOnly === true ? <ReadOnlyBadge /> : null}
         {agent.spawnedInLatestBatch ? (
           <span className="shrink-0 rounded-full border border-border px-1.5 text-2xs text-muted-foreground">
             new
@@ -406,6 +447,106 @@ function OutputView({ threadId, agentId }: { threadId: string; agentId: string }
   );
 }
 
+/** Send a message through BB; with `agentId` the OMP main agent forwards it to that subagent. */
+function MessageBox({
+  threadId,
+  agentId,
+  placeholder,
+  hint,
+}: {
+  threadId: string;
+  agentId: string | null;
+  placeholder: string;
+  hint: string;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const send = async () => {
+    const body = text.trim();
+    if (body === "" || sending) return;
+    setSending(true);
+    try {
+      const result = await rpc.call("agent_inject", {
+        threadId,
+        text: body,
+        ...(agentId === null ? {} : { agentId }),
+      });
+      setText("");
+      toast.success(`Message ${result.delivery} to the OMP session`);
+      rosterStore.request(threadId);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="border-t border-border p-2">
+      <div className="flex items-center gap-2">
+        <Input
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") void send();
+          }}
+          placeholder={placeholder}
+          aria-label={placeholder}
+        />
+        <Button size="sm" disabled={text.trim() === "" || sending} onClick={() => void send()}>
+          <Icon name={GLYPHS.send} className="size-3.5" />
+          Send
+        </Button>
+      </div>
+      <p className="mt-1 text-2xs text-muted-foreground">{hint}</p>
+    </div>
+  );
+}
+
+function PatchView({ threadId, agentId }: { threadId: string; agentId: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [patch, setPatch] = useState<{ content: string; truncated: boolean } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    rpc
+      .call("agent_patch", { threadId, agentId })
+      .then((result) => {
+        if (!cancelled) setPatch(result);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, threadId, agentId]);
+  const files = useMemo(
+    () => (patch === null ? [] : splitPatchByFile(patch.content)),
+    [patch],
+  );
+  if (error !== null) return <EmptyState>{error}</EmptyState>;
+  if (patch === null) return <EmptyState>Loading patch…</EmptyState>;
+  if (files.length === 0) return <EmptyState>The patch is empty.</EmptyState>;
+  return (
+    <div className="space-y-3">
+      {patch.truncated ? (
+        <p className="text-2xs text-muted-foreground">Patch clipped — the end is not shown.</p>
+      ) : null}
+      {files.map((file, index) => (
+        <div key={`${index}:${file.path}`} className="space-y-1">
+          <p className="truncate text-xs font-medium">{file.path}</p>
+          <Diff patch={file.patch} path={file.path} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+type PanelTab = "transcript" | "output" | "patch";
+
 function TranscriptPanel({
   threadId,
   agent,
@@ -416,44 +557,60 @@ function TranscriptPanel({
   onBack: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [tab, setTab] = useState<"transcript" | "output">("transcript");
+  const [requestedTab, setTab] = useState<PanelTab>("transcript");
   const [transcript, setTranscript] = useState<{
     entries: TranscriptEntry[];
     truncated: boolean;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const realtimeTick = useState(0);
 
+  const tabs: PanelTab[] = ["transcript"];
+  if (agent.hasMd || agent.hasJson) tabs.push("output");
+  if (agent.hasPatch) tabs.push("patch");
+  // A tab whose artifact vanished from the roster falls back to the transcript.
+  const tab = tabs.includes(requestedTab) ? requestedTab : "transcript";
+
+  // Follow the agent through the shared store: refetch when its entry changes,
+  // not on every raw realtime signal.
   useEffect(() => {
+    let cancelled = false;
     rpc
       .call("agent_transcript", { threadId, agentId: agent.id })
-      .then(setTranscript)
-      .catch((cause: unknown) =>
-        setError(cause instanceof Error ? cause.message : String(cause)),
-      );
-  }, [rpc, threadId, agent.id, realtimeTick[1]]);
-
-  // Follow live updates while this agent is open.
-  useRealtime(REALTIME_CHANGED, () => {
-    if (agent.status === "running") {
-      rpc
-        .call("agent_transcript", { threadId, agentId: agent.id })
-        .then(setTranscript)
-        .catch(() => undefined);
-    }
-  });
+      .then((result) => {
+        if (cancelled) return;
+        setTranscript(result);
+        setError(null);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, threadId, agent.id, agent.lastActivityAtMs, agent.status, agent.toolCount]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <Button variant="ghost" size="sm" onClick={onBack}>
-          <Icon name={GLYPHS.back} className="size-3.5" />
-          Roster
-        </Button>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium">{agent.id}</span>
+      <div className="border-b border-border px-3 py-2">
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={onBack}>
+            <Icon name={GLYPHS.back} className="size-3.5" />
+            Roster
+          </Button>
+          <span className="min-w-0 flex-1 truncate text-sm font-medium">{agent.id}</span>
+          {agent.readOnly === true ? <ReadOnlyBadge /> : null}
+        </div>
+        {agent.status === "failed" && agent.error !== null ? (
+          <p
+            role="alert"
+            className="mt-2 line-clamp-4 rounded-md border border-border px-2 py-1.5 text-xs text-[color:var(--bb-omp-tone-error)]"
+          >
+            {agent.error}
+          </p>
+        ) : null}
       </div>
       <div className="flex items-center gap-1 border-b border-border px-3 py-1.5">
-        {(["transcript", "output"] as const).map((value) => (
+        {tabs.map((value) => (
           <button
             key={value}
             type="button"
@@ -470,16 +627,16 @@ function TranscriptPanel({
         ))}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        {error !== null ? (
-          <EmptyState>{error}</EmptyState>
-        ) : tab === "transcript" ? (
-          transcript === null ? (
-            <EmptyState>Loading transcript…</EmptyState>
-          ) : (
-            <TranscriptView entries={transcript.entries} truncated={transcript.truncated} />
-          )
-        ) : (
+        {tab === "output" ? (
           <OutputView threadId={threadId} agentId={agent.id} />
+        ) : tab === "patch" ? (
+          <PatchView threadId={threadId} agentId={agent.id} />
+        ) : error !== null ? (
+          <EmptyState>{error}</EmptyState>
+        ) : transcript === null ? (
+          <EmptyState>Loading transcript…</EmptyState>
+        ) : (
+          <TranscriptView entries={transcript.entries} truncated={transcript.truncated} />
         )}
       </div>
       <div className="space-y-1 border-t border-border px-3 py-2 text-2xs text-muted-foreground">
@@ -490,9 +647,25 @@ function TranscriptPanel({
           {formatCost(agent.costTotal)}
         </p>
       </div>
+      {agent.status === "running" ? (
+        <MessageBox
+          threadId={threadId}
+          agentId={agent.id}
+          placeholder={`Message ${agent.id}`}
+          hint={`The OMP main agent forwards this to ${agent.id}.`}
+        />
+      ) : null}
     </div>
   );
 }
+
+const STATUS_FILTER_LABEL: Record<AgentStatus, string> = {
+  running: "Running",
+  failed: "Failed",
+  finished: "Finished",
+  interrupted: "Interrupted",
+  partial: "Stopped",
+};
 
 function HubPanel({
   threadId,
@@ -503,43 +676,36 @@ function HubPanel({
 }) {
   const hubParams = parseHubParams(params);
   const targetThreadId = hubParams.threadId ?? threadId;
-  const rpc = useRpc<typeof rpcContract>();
-  const { roster, error, loading, refetch } = useAgentRoster(targetThreadId);
+  const { roster, error, loading } = useRoster(targetThreadId);
   const [selectedId, setSelectedId] = useState<string | null>(hubParams.agentId);
-  // The same tab can be re-pointed at another agent by new params.
+  const [requestedFilter, setFilter] = useState<AgentStatus | "all">("all");
+  // The same tab can be re-pointed by new params; openSeq makes every explicit
+  // open count, including the same agent again after going back to the roster.
   useEffect(() => {
     setSelectedId(hubParams.agentId);
-  }, [hubParams.agentId]);
-  const [injectText, setInjectText] = useState("");
-  const [injecting, setInjecting] = useState(false);
+  }, [hubParams.agentId, hubParams.openSeq]);
 
   const selected = useMemo(
     () => roster?.agents.find((agent) => agent.id === selectedId) ?? null,
     [roster, selectedId],
   );
-
-  const inject = async () => {
-    const text = injectText.trim();
-    if (text === "" || injecting) return;
-    setInjecting(true);
-    try {
-      const result = await rpc.call("agent_inject", {
-        threadId: targetThreadId,
-        text,
-      });
-      setInjectText("");
-      toast.success(`Message ${result.delivery} to the OMP session`);
-      refetch();
-    } catch (cause) {
-      toast.error(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setInjecting(false);
-    }
-  };
+  const agents = roster?.agents ?? [];
+  const counts = useMemo(() => statusCounts(agents), [agents]);
+  const totals = useMemo(() => rosterTotals(agents), [agents]);
+  // A filter whose status left the roster shows everything again.
+  const filter =
+    requestedFilter !== "all" && counts.some((entry) => entry.status === requestedFilter)
+      ? requestedFilter
+      : "all";
+  const rows = useMemo(
+    () => flattenAgentTree(buildAgentTree(filterByStatus(agents, filter))),
+    [agents, filter],
+  );
 
   if (selected !== null) {
     return (
       <TranscriptPanel
+        key={selected.id}
         threadId={targetThreadId}
         agent={selected}
         onBack={() => setSelectedId(null)}
@@ -547,19 +713,46 @@ function HubPanel({
     );
   }
 
-  const agents = roster?.agents ?? [];
   const running = agents.filter((agent) => agent.status === "running").length;
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground">
-        <span className="font-medium text-foreground">
-          {agents.length} subagent{agents.length === 1 ? "" : "s"}
-        </span>
-        <span>· {running} running</span>
-        {loading ? <Icon name={GLYPHS.spinner} className="size-3 animate-spin" /> : null}
+      <div className="space-y-1.5 border-b border-border px-3 py-2 text-xs text-muted-foreground">
+        <div className="flex items-center gap-2">
+          <span className="font-medium text-foreground">
+            {agents.length} subagent{agents.length === 1 ? "" : "s"}
+          </span>
+          <span>· {running} running</span>
+          {loading ? <Icon name={GLYPHS.spinner} className="size-3 animate-spin" /> : null}
+        </div>
+        {agents.length > 0 ? (
+          <>
+            <p>
+              {formatTokens(totals.tokensIn)} in · {formatTokens(totals.tokensOut)} out ·{" "}
+              {formatCost(totals.cost)}
+            </p>
+            <div className="flex flex-wrap gap-1" role="group" aria-label="Filter by status">
+              {([{ status: "all" as const, count: agents.length }, ...counts]).map((entry) => (
+                <button
+                  key={entry.status}
+                  type="button"
+                  aria-pressed={filter === entry.status}
+                  onClick={() => setFilter(entry.status)}
+                  className={cn(
+                    "rounded-full border border-border px-2 py-0.5 text-2xs",
+                    filter === entry.status
+                      ? "bg-accent text-foreground"
+                      : "hover:bg-accent/50 hover:text-foreground",
+                  )}
+                >
+                  {entry.status === "all" ? "All" : STATUS_FILTER_LABEL[entry.status]} {entry.count}
+                </button>
+              ))}
+            </div>
+          </>
+        ) : null}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
-        {error !== null ? (
+        {error !== null && roster === null ? (
           <EmptyState>{error}</EmptyState>
         ) : roster === null ? (
           <EmptyState>Loading roster…</EmptyState>
@@ -573,10 +766,16 @@ function HubPanel({
           </EmptyState>
         ) : (
           <div className="space-y-1">
-            {agents.map((agent) => (
+            {error !== null ? (
+              <p role="alert" className="px-1 text-2xs text-[color:var(--bb-omp-tone-error)]">
+                Refresh failed: {error}
+              </p>
+            ) : null}
+            {rows.map(({ agent, depth }) => (
               <AgentRow
                 key={agent.id}
                 agent={agent}
+                depth={depth}
                 selected={false}
                 onSelect={() => setSelectedId(agent.id)}
               />
@@ -584,30 +783,12 @@ function HubPanel({
           </div>
         )}
       </div>
-      <div className="border-t border-border p-2">
-        <div className="flex items-center gap-2">
-          <Input
-            value={injectText}
-            onChange={(event) => setInjectText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") void inject();
-            }}
-            placeholder="Message the OMP session…"
-            aria-label="Message the OMP session"
-          />
-          <Button
-            size="sm"
-            disabled={injectText.trim() === "" || injecting}
-            onClick={() => void inject()}
-          >
-            <Icon name={GLYPHS.send} className="size-3.5" />
-            Send
-          </Button>
-        </div>
-        <p className="mt-1 text-2xs text-muted-foreground">
-          Sends through BB: starts a turn when idle, steers when running.
-        </p>
-      </div>
+      <MessageBox
+        threadId={targetThreadId}
+        agentId={null}
+        placeholder="Message the OMP session…"
+        hint="Sends through BB: starts a turn when idle, steers when running."
+      />
     </div>
   );
 }
@@ -697,6 +878,25 @@ function SessionsPage() {
   );
 }
 
+const OMP_PROVIDER_ID = "acp-omp";
+
+/** Which of the threads on screen run on OMP (the menu item is OMP-only). */
+function useOmpThreadIds({ threadIds }: { threadIds: readonly string[] }): ReadonlySet<string> {
+  const { threads } = experimental_useSidebarThreads();
+  return useMemo(
+    () =>
+      new Set(
+        threads
+          .filter((thread) => thread.providerId === OMP_PROVIDER_ID && threadIds.includes(thread.id))
+          .map((thread) => thread.id),
+      ),
+    [threads, threadIds],
+  );
+}
+
+/** The running agent last opened per thread, so "next" cycles through them. */
+const lastOpenedRunning = new Map<string, string>();
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "sessions",
@@ -720,10 +920,84 @@ export default definePluginApp((app) => {
     component: HeaderChip,
   });
 
+  // Mounted once per app window, outside the routes: the single place the
+  // realtime feed, reconnect reconciliation and failure toasts are wired.
+  app.slots.experimental_appOverlay({
+    id: "roster-feed",
+    component: RosterFeed,
+  });
+
+  app.slots.experimental_threadAction<ReadonlySet<string>>({
+    id: "open-hub",
+    title: "Open OMP subagents",
+    icon: GLYPHS.roster,
+    group: experimental_THREAD_ACTION_GROUPS.open,
+    useData: useOmpThreadIds,
+    item: ({ thread, data, navigate }) =>
+      data.has(thread.id)
+        ? {
+            label: "Open OMP subagents",
+            icon: GLYPHS.roster,
+            run: () => {
+              navigate.openThreadPanel({
+                actionId: "hub",
+                title: "OMP Subagents",
+                params: hubPanelParams({ threadId: thread.id, projectId: thread.projectId }),
+              });
+            },
+          }
+        : null,
+  });
+
+  // The command context carries no provider, so "an OMP thread" means one the
+  // roster store has loaded as an OMP session (every OMP thread header does).
+  app.commands.register({
+    id: "open-hub",
+    title: "Open OMP subagents",
+    isAvailable: ({ threadId }) =>
+      threadId !== null && rosterStore.sessionUuidOf(threadId) !== null,
+    run: ({ threadId, projectId, openPanel }) => {
+      if (threadId === null) return;
+      openPanel({
+        actionId: "hub",
+        title: "OMP Subagents",
+        params: hubPanelParams({ threadId, projectId }),
+      });
+    },
+  });
+
+  app.commands.register({
+    id: "open-next-running",
+    title: "Open next running subagent",
+    isAvailable: ({ threadId }) =>
+      threadId !== null &&
+      nextRunningAgent(rosterStore.getView(threadId).roster?.agents ?? [], null) !== null,
+    run: ({ threadId, projectId, openPanel }) => {
+      if (threadId === null) return;
+      const agents = rosterStore.getView(threadId).roster?.agents ?? [];
+      const next = nextRunningAgent(agents, lastOpenedRunning.get(threadId) ?? null);
+      if (next === null) return;
+      lastOpenedRunning.set(threadId, next.id);
+      openPanel({
+        actionId: "hub",
+        title: next.id,
+        params: hubPanelParams({ threadId, projectId, agentId: next.id }),
+      });
+    },
+  });
+
   app.contentScripts.register({
     id: "timeline-strip",
-    mount({ signal }) {
-      startTimelineStrip(signal);
+    mount(context) {
+      startTimelineStrip(context.signal);
+      // Older bb clients lack the row-status setter: feature-detect it.
+      if (context.experimental_setThreadRowStatus !== undefined) {
+        syncRowStatuses(
+          rosterStore,
+          (threadId, status) => context.experimental_setThreadRowStatus?.(threadId, status),
+          context.signal,
+        );
+      }
     },
   });
 });

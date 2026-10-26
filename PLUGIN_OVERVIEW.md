@@ -25,7 +25,7 @@ interrupted, or partial for an agent that stopped without a clean end.
 
 ## Requirements
 
-- BB 0.46 or newer.
+- BB 0.47 or newer.
 - Threads on the `omp` provider, with the `omp` CLI on the thread's machine.
 
 ## Limits

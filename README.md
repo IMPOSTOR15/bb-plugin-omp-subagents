@@ -41,7 +41,7 @@ Statuses are read from each transcript: `running` (written to in the last
 
 ## Requirements
 
-- BB 0.46 or newer.
+- BB 0.47 or newer.
 - Threads on the `omp` provider (`acp-omp`). The `omp` CLI must run on the same
   machine as the thread's workspace; the plugin reads
   `~/.omp/agent/sessions` on that machine through BB's host daemon.

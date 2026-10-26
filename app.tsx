@@ -3,7 +3,7 @@
 // Surfaces:
 //  * A thread-header chip on every OMP thread: live subagent count + popover
 //    roster (click to open the Hub panel for that thread).
-//  * `OMP Agents` thread-panel action: the full Agent Hub panel — roster with
+//  * `OMP Subagents` thread tab: the full Agent Hub panel — roster with
 //    live progress, per-agent transcript, final output, and message injection.
 //  * A nav panel that lists this machine's recent OMP sessions with their
 //    subagent counts.
@@ -905,7 +905,9 @@ export default definePluginApp((app) => {
     component: SessionsPage,
   });
 
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: "hub",
     title: "OMP Subagents",
     icon: GLYPHS.roster,

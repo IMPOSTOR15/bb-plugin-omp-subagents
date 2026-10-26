@@ -4,7 +4,7 @@
 // the OMP session tree and emits `changed` signals whenever a watched session's
 // files change, so live rosters update in BB without polling loops.
 import { readdir, realpath, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, isAbsolute, join, relative, sep, type PlatformPath } from "node:path";
 import { homedir } from "node:os";
 import {
   experimental_defineHostEntry,
@@ -31,13 +31,33 @@ const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 class UnsafePathError extends Error {}
 
 /**
+ * The path functions that parse a host path. The host's own flavor by default;
+ * Windows paths use `\` and a drive letter, so nothing here splits on `/`.
+ */
+export type PathFlavor = Pick<PlatformPath, "basename" | "isAbsolute" | "relative" | "sep">;
+
+const NATIVE_PATH: PathFlavor = { basename, isAbsolute, relative, sep };
+
+/**
+ * True when `dir` is exactly `<root>/<workspace>/<session>`. Both must already
+ * be realpath'ed. On Windows `relative` compares case-insensitively and returns
+ * an absolute path when `dir` is on another drive.
+ */
+export function isSessionDirUnder(root: string, dir: string, p: PathFlavor = NATIVE_PATH): boolean {
+  const rel = p.relative(root, dir);
+  if (rel === "" || p.isAbsolute(rel)) return false;
+  const parts = rel.split(p.sep);
+  return parts.length === 2 && !parts.includes("..");
+}
+
+/**
  * Confinement: every caller-supplied artifactsDir/agentId pair must resolve
  * to a real directory directly inside the OMP sessions root, and the agent
  * id must be a flat basename. `realpath` defeats `..`, symlinks, and encoded
  * variants; the sessions listing is the source of truth for what exists.
  */
 async function confinedArtifactsDir(artifactsDir: string): Promise<string> {
-  if (!artifactsDir.startsWith("/")) {
+  if (!isAbsolute(artifactsDir)) {
     throw new UnsafePathError("artifactsDir must be absolute");
   }
   const root = sessionsRoot();
@@ -49,15 +69,8 @@ async function confinedArtifactsDir(artifactsDir: string): Promise<string> {
   } catch {
     throw new UnsafePathError("artifactsDir is not a session directory");
   }
-  if (realDir === realRoot || !realDir.startsWith(`${realRoot}/`)) {
+  if (!isSessionDirUnder(realRoot, realDir)) {
     throw new UnsafePathError("artifactsDir is not a session directory");
-  }
-  // exactly one level below the root: <root>/<workspace>/<session>
-  const relative = realDir.slice(realRoot.length + 1);
-  if (relative.split("/").length !== 2) {
-    throw new UnsafePathError(
-      "artifactsDir must be a session directory, not a workspace or nested dir",
-    );
   }
   return realDir;
 }
@@ -137,8 +150,8 @@ const AGENT_JSONL = /^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/;
 const AGENT_ARTIFACT = /^[A-Za-z0-9][A-Za-z0-9._-]*\.(jsonl|md|json|patch)$/;
 
 /** A changed path matters to rosters only when it is an agent's own file. */
-function isAgentArtifact(path: string): boolean {
-  const name = path.split("/").pop() ?? "";
+export function isAgentArtifact(file: string, p: PathFlavor = NATIVE_PATH): boolean {
+  const name = p.basename(file);
   return name !== "__advisor.jsonl" && AGENT_ARTIFACT.test(name);
 }
 
@@ -205,7 +218,7 @@ function remember<V>(cache: Map<string, V>, key: string, value: V, max: number):
 
 /** Forget cached parses under `confined` that `keep` does not list. */
 function pruneSessionCache(confined: string, keep: ReadonlySet<string>): void {
-  const prefix = `${confined}/`;
+  const prefix = `${confined}${sep}`;
   for (const file of transcriptCache.keys()) {
     if (file.startsWith(prefix) && !keep.has(file)) transcriptCache.delete(file);
   }
@@ -389,8 +402,8 @@ function touchWatch(confined: string): void {
 }
 
 /** The OMP session uuid: the part of `<timestamp>_<uuid>` after the last `_`. */
-function sessionUuidFromDir(artifactsDir: string): string {
-  const name = artifactsDir.split("/").pop() ?? artifactsDir;
+export function sessionUuidFromDir(artifactsDir: string, p: PathFlavor = NATIVE_PATH): string {
+  const name = p.basename(artifactsDir);
   return name.slice(name.lastIndexOf("_") + 1);
 }
 
@@ -595,7 +608,7 @@ async function startWatch(
         // roster field: only an agent's own files are worth a refetch.
         const paths = event.changes
           .map((change) => change.path)
-          .filter(isAgentArtifact);
+          .filter((file) => isAgentArtifact(file));
         if (paths.length === 0) return;
         await context.experimental_emitSignal("changed", { sessionUuid, paths });
       },

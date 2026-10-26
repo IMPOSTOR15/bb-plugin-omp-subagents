@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 const tmp = await mkdtemp(join(tmpdir(), "omp-sessions-"));
@@ -14,7 +14,7 @@ const outside = await realpath(await mkdtemp(join(tmpdir(), "omp-outside-")));
 const session = join(root, "-ws", "2026-01-01T00-00-00-000Z_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
 
 // The sessions root is read per call, so a static import is safe here.
-import host from "../src/host.ts";
+import host, { isAgentArtifact, isSessionDirUnder, sessionUuidFromDir } from "../src/host.ts";
 import { clipBody, parseAgentFile, parseLatestTaskAgents, parseTranscript, taskBody } from "../src/omp.ts";
 import { activityLine } from "../src/activity.ts";
 import { hubPanelParams, parseHubParams, parseOpenAgentRequest } from "../src/open-agent.ts";
@@ -207,6 +207,40 @@ describe("host confinement", () => {
     })) as { artifactsDir: string | null };
     assert.ok(result.artifactsDir !== null);
     assert.equal(await realpath(result.artifactsDir), session);
+  });
+});
+
+describe("Windows host paths", () => {
+  const winRoot = "C:\\Users\\user\\.omp\\agent\\sessions";
+  const winUuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+  const winSession = `${winRoot}\\-ws\\2026-01-01T00-00-00-000Z_${winUuid}`;
+
+  it("accepts a session directory two levels below the root", () => {
+    assert.equal(isSessionDirUnder(winRoot, winSession, win32), true);
+  });
+
+  for (const [name, dir] of [
+    ["the root itself", winRoot],
+    ["a workspace", `${winRoot}\\-ws`],
+    ["a nested dir", `${winSession}\\Parent`],
+    ["the root's parent", "C:\\Users\\user\\.omp\\agent"],
+    ["a sibling root sharing the prefix", `${winRoot}-old\\-ws\\2026_${winUuid}`],
+    ["the same layout on another drive", `D:\\Users\\user\\.omp\\agent\\sessions\\-ws\\2026_${winUuid}`],
+  ] as const) {
+    it(`refuses ${name}`, () => {
+      assert.equal(isSessionDirUnder(winRoot, dir, win32), false);
+    });
+  }
+
+  it("signals carry the bare uuid of a backslash session path", () => {
+    assert.equal(sessionUuidFromDir(winSession, win32), winUuid);
+  });
+
+  it("a watched agent file is recognised by its basename, a tool log is not", () => {
+    assert.equal(isAgentArtifact(`${winSession}\\Parent\\Parent.Child.jsonl`, win32), true);
+    assert.equal(isAgentArtifact(`${winSession}\\Scout.md`, win32), true);
+    assert.equal(isAgentArtifact(`${winSession}\\1.bash.log`, win32), false);
+    assert.equal(isAgentArtifact(`${winSession}\\__advisor.jsonl`, win32), false);
   });
 });
 
